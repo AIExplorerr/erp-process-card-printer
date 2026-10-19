@@ -76,7 +76,7 @@ onBeforeMount(() => {
 .my-grid-table {
   display: flex;
   flex-direction: column;
-  width: 100%;
+  width: 90%;
   font-family: sans-serif;
   font-size: 0.8rem;
   letter-spacing: 1px;
@@ -111,10 +111,47 @@ onBeforeMount(() => {
   display: block;
 }
 
+@page {
+  size: 100mm 150mm;
+  margin: 4mm;
+}
+
 @media print {
+  .my-grid-table {
+    width: 92mm;
+    max-width: 92mm;
+    box-sizing: border-box;
+    font-size: 9pt;
+    letter-spacing: 0;
+    border: 1px solid #000;
+    border-radius: 0;
+    overflow: visible;
+  }
+
+  .my-grid-row {
+    grid-template-columns: 28% 72%;
+    break-inside: avoid;
+  }
+
+  .my-grid-cell {
+    padding: 1.5mm;
+    border-right: 1px solid #000;
+    border-bottom: 1px solid #000;
+    overflow-wrap: anywhere;
+  }
+
+  .value-span {
+    grid-column: auto;
+  }
+
   .qr-image {
-    width: 30mm;
-    height: 30mm;
+    width: 25mm;
+    height: 25mm;
+    object-fit: contain;
+  }
+
+  #my-print-container {
+    break-inside: avoid;
   }
 }
 </style>
