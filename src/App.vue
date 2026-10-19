@@ -38,9 +38,35 @@ onBeforeMount(() => {
         class="my-grid-row"
       >
         <div class="my-grid-cell">{{ fieldItem[0].name }}</div>
-        <div class="my-grid-cell">{{ fieldItem[0].value }}</div>
-        <div class="my-grid-cell">{{ fieldItem[1].name }}</div>
-        <div class="my-grid-cell">{{ fieldItem[1].value }}</div>
+          <div class="my-grid-cell">
+            <template v-if="fieldItem[0].type === FieldType.Attachment">
+              <img
+                v-for="(url, i) in fieldItem[0].value"
+                :key="i"
+                :src="url"
+                class="qr-image"
+              />
+            </template>
+            <template v-else>
+              {{ fieldItem[0].value }}
+            </template>
+          </div>
+          
+          <div class="my-grid-cell">{{ fieldItem[1].name }}</div>
+          
+          <div class="my-grid-cell">
+            <template v-if="fieldItem[1].type === FieldType.Attachment">
+              <img
+                v-for="(url, i) in fieldItem[1].value"
+                :key="i"
+                :src="url"
+                class="qr-image"
+              />
+            </template>
+            <template v-else>
+              {{ fieldItem[1].value }}
+            </template>
+          </div>
       </div>
     </template>
   </div>
@@ -77,5 +103,18 @@ onBeforeMount(() => {
 }
 .my-grid-cell:last-child {
   border-right: none;
+}
+.qr-image {
+  width: 120px;
+  height: 120px;
+  object-fit: contain;
+  display: block;
+}
+
+@media print {
+  .qr-image {
+    width: 30mm;
+    height: 30mm;
+  }
 }
 </style>
