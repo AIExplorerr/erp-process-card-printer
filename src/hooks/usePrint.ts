@@ -31,25 +31,41 @@ const usePrint = () => {
     getCurrentRecord();
   }
 
+
   const getSettingList = async () => {
     const data = await bitable.bridge.getData<IFieldMetaSettings[]>(SETTING_KEY);
-
-    const cachedConfig = Array.isArray(data) ? data.reduce((acc, curr) => {
-      acc[curr.fieldId] = curr;
-      return acc;
-    }, {} as Record<string, IFieldMetaSettings>) : {};
-
-    const result = fieldList.value.map(field => {
-      return cachedConfig[field.id] || {
+  
+    const fieldMap = new Map(
+      fieldList.value.map(field => [field.id, field])
+    );
+  
+    // Preserve the previously saved field order.
+    const savedSettings = Array.isArray(data)
+      ? data
+          .filter(setting => fieldMap.has(setting.fieldId))
+          .map(setting => ({
+            ...setting,
+            name: fieldMap.get(setting.fieldId)!.name
+          }))
+      : [];
+  
+    const savedIds = new Set(
+      savedSettings.map(setting => setting.fieldId)
+    );
+  
+    // Append newly created fields without altering the saved order.
+    const newFields = fieldList.value
+      .filter(field => !savedIds.has(field.id))
+      .map(field => ({
         fieldId: field.id,
         name: field.name,
         oneLine: field.type === FieldType.Attachment,
-        hidden: false,
-      }
-    })
+        hidden: false
+      }));
+  
+    settingList.value = [...savedSettings, ...newFields];
+  };
 
-    handleSettingListUpdate(result, false);
-  }
 
   const getCurrentRecord = async () => {
     if (!currentRecordId.value) {
