@@ -31,7 +31,6 @@ const usePrint = () => {
     getCurrentRecord();
   }
 
-
   const getSettingList = async () => {
     const data = await bitable.bridge.getData<IFieldMetaSettings[]>(SETTING_KEY);
   
@@ -39,7 +38,7 @@ const usePrint = () => {
       fieldList.value.map(field => [field.id, field])
     );
   
-    // Preserve the previously saved field order.
+    // Keep saved fields in their original, user-defined order.
     const savedSettings = Array.isArray(data)
       ? data
           .filter(setting => fieldMap.has(setting.fieldId))
@@ -53,19 +52,18 @@ const usePrint = () => {
       savedSettings.map(setting => setting.fieldId)
     );
   
-    // Append newly created fields without altering the saved order.
+    // New fields stay hidden until explicitly added to the card.
     const newFields = fieldList.value
       .filter(field => !savedIds.has(field.id))
       .map(field => ({
         fieldId: field.id,
         name: field.name,
         oneLine: field.type === FieldType.Attachment,
-        hidden: false
+        hidden: true
       }));
   
     settingList.value = [...savedSettings, ...newFields];
   };
-
 
   const getCurrentRecord = async () => {
     if (!currentRecordId.value) {
