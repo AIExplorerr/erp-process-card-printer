@@ -358,7 +358,8 @@ watch(
     border: 1px solid #000;
     border-radius: 0;
 
-    margin: 0;
+    margin-left: auto;
+    margin-right: auto;
   }
 
   .my-grid-row {
