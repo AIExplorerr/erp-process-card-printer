@@ -1,9 +1,46 @@
 <script setup lang="ts">
 import { FieldType } from '@lark-base-open/js-sdk';
-import { onBeforeMount } from 'vue';
+import { onBeforeMount, ref, watch } from 'vue';
+import { bitable } from '@lark-base-open/js-sdk';
 import usePrint from './hooks/usePrint';
 const { selectRecord, handlePrint, init, handleSetting, handleSettingListUpdate, currentRecord, isSettingPanelShow, settingList } = usePrint();
+const LAYOUT_KEY = 'erp_process_card_layout_v1';
 
+const layout = ref({
+  fontSize: 9,
+  cellPadding: 1.5
+});
+
+onBeforeMount(async () => {
+  try {
+    const saved = await bitable.bridge.getData<{
+      fontSize?: number;
+      cellPadding?: number;
+    }>(LAYOUT_KEY);
+
+    if (saved) {
+      layout.value = {
+        fontSize: saved.fontSize ?? 9,
+        cellPadding: saved.cellPadding ?? 1.5
+      };
+    }
+  } catch (error) {
+    console.error('Failed to load layout settings:', error);
+  }
+});
+
+watch(
+  layout,
+  async value => {
+    try {
+      await bitable.bridge.setData(LAYOUT_KEY, { ...value });
+    } catch (error) {
+      console.error('Failed to save layout settings:', error);
+    }
+  },
+  { deep: true }
+);
+  
 onBeforeMount(() => {
   init();
 });
@@ -30,18 +67,44 @@ onBeforeMount(() => {
           @update:list="handleSettingListUpdate"
         />
       </el-tab-pane>
-  
+      
       <el-tab-pane label="排版设置" name="layout">
-        <el-empty
-          description="排版设置将在下一步配置"
-          :image-size="70"
-        />
+        <el-form label-position="top">
+          <el-form-item label="字体大小 (pt)">
+            <el-slider
+              v-model="layout.fontSize"
+              :min="7"
+              :max="13"
+              :step="0.5"
+              show-input
+            />
+          </el-form-item>
+      
+          <el-form-item label="单元格间距 (mm)">
+            <el-slider
+              v-model="layout.cellPadding"
+              :min="0.5"
+              :max="4"
+              :step="0.5"
+              show-input
+            />
+          </el-form-item>
+        </el-form>
       </el-tab-pane>
+      
     </el-tabs>
   </el-dialog>
   </div>
 
-  <div v-if="currentRecord" id="my-print-container" class="my-grid-table">
+    <div
+      v-if="currentRecord"
+      id="my-print-container"
+      class="my-grid-table"
+      :style="{
+        '--card-font-size': layout.fontSize + 'pt',
+        '--card-cell-padding': layout.cellPadding + 'mm'
+      }"
+    >
     <template v-for="(fieldItem, index) in currentRecord" :key="index">
       <div
         v-if="fieldItem.length === 1"
@@ -141,7 +204,7 @@ onBeforeMount(() => {
     width: 92mm;
     max-width: 92mm;
     box-sizing: border-box;
-    font-size: 9pt;
+    font-size: var(--card-font-size, 9pt);
     letter-spacing: 0;
     border: 1px solid #000;
     border-radius: 0;
@@ -154,7 +217,7 @@ onBeforeMount(() => {
   }
 
   .my-grid-cell {
-    padding: 1.5mm;
+    padding: var(--card-cell-padding, 1.5mm);
     border-right: 1px solid #000;
     border-bottom: 1px solid #000;
     overflow-wrap: anywhere;
