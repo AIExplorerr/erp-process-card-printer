@@ -16,18 +16,29 @@ onBeforeMount(() => {
     <el-button @click="handlePrint">打印</el-button>
     <el-button @click="handleSetting">设置</el-button>
 
-    <el-dialog
-      v-model="isSettingPanelShow"
-      title="工艺卡字段设置"
-      width="600px"
-      top="5vh"
-      class="print-settings-dialog"
-    >
-      <settings-panel
-        :list="settingList"
-        @update:list="handleSettingListUpdate"
-      />
-    </el-dialog>
+  <el-dialog
+    v-model="isSettingPanelShow"
+    title="工艺卡打印设置"
+    width="600px"
+    top="5vh"
+    class="print-settings-dialog"
+  >
+    <el-tabs model-value="fields">
+      <el-tab-pane label="字段设置" name="fields">
+        <settings-panel
+          :list="settingList"
+          @update:list="handleSettingListUpdate"
+        />
+      </el-tab-pane>
+  
+      <el-tab-pane label="排版设置" name="layout">
+        <el-empty
+          description="排版设置将在下一步配置"
+          :image-size="70"
+        />
+      </el-tab-pane>
+    </el-tabs>
+  </el-dialog>
   </div>
 
   <div v-if="currentRecord" id="my-print-container" class="my-grid-table">
