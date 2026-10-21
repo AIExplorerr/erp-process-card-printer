@@ -16,8 +16,17 @@ onBeforeMount(() => {
     <el-button @click="handlePrint">打印</el-button>
     <el-button @click="handleSetting">设置</el-button>
 
-    <el-dialog v-model="isSettingPanelShow" title="设置">
-      <settings-panel :list="settingList" @update:list="handleSettingListUpdate" />
+    <el-dialog
+      v-model="isSettingPanelShow"
+      title="工艺卡字段设置"
+      width="600px"
+      top="5vh"
+      class="print-settings-dialog"
+    >
+      <settings-panel
+        :list="settingList"
+        @update:list="handleSettingListUpdate"
+      />
     </el-dialog>
   </div>
 
