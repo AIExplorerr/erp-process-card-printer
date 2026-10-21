@@ -24,7 +24,8 @@ const LAYOUT_KEY = 'erp_process_card_layout_v1';
 const layout = ref({
   fontSize: 9,
   cellPadding: 1.5,
-  labelWidth: 32
+  labelWidth: 32,
+  qrSize: 20
 });
 
 // Always render one field per row.
@@ -46,13 +47,15 @@ onBeforeMount(async () => {
       fontSize?: number;
       cellPadding?: number;
       labelWidth?: number;
+      qrSize?: number;
     }>(LAYOUT_KEY);
 
     if (saved) {
       layout.value = {
         fontSize: saved.fontSize ?? 9,
         cellPadding: saved.cellPadding ?? 1.5,
-        labelWidth: saved.labelWidth ?? 32
+        labelWidth: saved.labelWidth ?? 32,
+        qrSize: saved.qrSize ?? 20
       };
     }
   } catch (error) {
@@ -154,7 +157,17 @@ watch(
               show-input
             />
           </el-form-item>
-
+          
+          <el-form-item label="二维码尺寸 (mm)">
+            <el-slider
+              v-model="layout.qrSize"
+              :min="15"
+              :max="30"
+              :step="1"
+              show-input
+            />
+          </el-form-item>
+          
           <el-divider />
 
           <div class="layout-description">
@@ -183,7 +196,8 @@ watch(
     :style="{
       '--card-font-size': layout.fontSize + 'pt',
       '--card-cell-padding': layout.cellPadding + 'mm',
-      '--card-label-width': layout.labelWidth + '%'
+      '--card-label-width': layout.labelWidth + '%',
+      '--card-qr-size': layout.qrSize + 'mm'
     }"
   >
     <div
@@ -304,11 +318,9 @@ watch(
 
 .qr-image {
   display: block;
-
-  width: 25mm;
-  height: 25mm;
+  width: var(--card-qr-size, 20mm);
+  height: var(--card-qr-size, 20mm);
   max-width: 100%;
-
   object-fit: contain;
 }
 
@@ -364,9 +376,8 @@ watch(
   }
 
   .qr-image {
-    display: block;
-    width: 20mm;
-    height: 20mm;
+    width: var(--card-qr-size, 20mm);
+    height: var(--card-qr-size, 20mm);
     max-width: 100%;
     object-fit: contain;
   }
