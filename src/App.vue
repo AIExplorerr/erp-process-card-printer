@@ -364,9 +364,9 @@ watch(
   }
 
   .qr-image {
-    width: 25mm;
-    height: 25mm;
-
+    display: block;
+    width: 20mm;
+    height: 20mm;
     max-width: 100%;
     object-fit: contain;
   }
