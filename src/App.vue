@@ -1,7 +1,6 @@
-
 <script setup lang="ts">
 import { bitable, FieldType } from '@lark-base-open/js-sdk';
-import { computed, onBeforeMount, ref, watch } from 'vue';
+import { onBeforeMount, ref, watch } from 'vue';
 import usePrint from './hooks/usePrint';
 
 const {
@@ -10,17 +9,13 @@ const {
   init,
   handleSetting,
   handleSettingListUpdate,
-  currentRecord,
+  currentRecords,
+  isLoading,
   isSettingPanelShow,
   settingList
 } = usePrint();
 
-// --------------------------------------
-// Print layout settings
-// --------------------------------------
-
 const LAYOUT_KEY = 'erp_process_card_layout_v1';
-
 const layout = ref({
   fontSize: 9,
   cellPadding: 1.5,
@@ -28,20 +23,8 @@ const layout = ref({
   qrSize: 20
 });
 
-// Always render one field per row.
-// Existing field selection and ordering
-// remain managed by usePrint.ts.
-const printFields = computed(() => {
-  return currentRecord.value?.flat() ?? [];
-});
-
-// --------------------------------------
-// Load saved layout
-// --------------------------------------
-
 onBeforeMount(async () => {
   await init();
-
   try {
     const saved = await bitable.bridge.getData<{
       fontSize?: number;
@@ -63,43 +46,31 @@ onBeforeMount(async () => {
   }
 });
 
-// --------------------------------------
-// Save settings when they change
-// --------------------------------------
-
-watch(
-  layout,
-  async value => {
-    try {
-      await bitable.bridge.setData(
-        LAYOUT_KEY,
-        { ...value }
-      );
-    } catch (error) {
-      console.error('Failed to save layout settings:', error);
-    }
-  },
-  { deep: true }
-);
+watch(layout, async value => {
+  try {
+    await bitable.bridge.setData(LAYOUT_KEY, { ...value });
+  } catch (error) {
+    console.error('Failed to save layout settings:', error);
+  }
+}, { deep: true });
 </script>
 
 <template>
-  <!-- Main controls -->
   <div class="my-tools-container">
-    <el-button @click="selectRecord">
+    <el-button :loading="isLoading" @click="selectRecord">
       选择记录
     </el-button>
-
-    <el-button @click="handlePrint">
+    <el-button :disabled="isLoading || currentRecords.length === 0" @click="handlePrint">
       打印
     </el-button>
-
     <el-button @click="handleSetting">
       设置
     </el-button>
+    <span v-if="currentRecords.length" class="card-count">
+      已选择 {{ currentRecords.length }} 条记录
+    </span>
   </div>
 
-  <!-- Settings window -->
   <el-dialog
     v-model="isSettingPanelShow"
     title="工艺卡打印设置"
@@ -109,212 +80,117 @@ watch(
     append-to-body
   >
     <el-tabs model-value="fields">
-
-      <!-- Field selection -->
-      <el-tab-pane
-        label="字段设置"
-        name="fields"
-      >
+      <el-tab-pane label="字段设置" name="fields">
         <settings-panel
           :list="settingList"
           @update:list="handleSettingListUpdate"
         />
       </el-tab-pane>
 
-      <!-- Layout controls -->
-      <el-tab-pane
-        label="排版设置"
-        name="layout"
-      >
+      <el-tab-pane label="排版设置" name="layout">
         <el-form label-position="top">
-
           <el-form-item label="字体大小 (pt)">
-            <el-slider
-              v-model="layout.fontSize"
-              :min="7"
-              :max="13"
-              :step="0.5"
-              show-input
-            />
+            <el-slider v-model="layout.fontSize" :min="7" :max="13" :step="0.5" show-input />
           </el-form-item>
-
           <el-form-item label="上下间距 (mm)">
-            <el-slider
-              v-model="layout.cellPadding"
-              :min="0.5"
-              :max="4"
-              :step="0.5"
-              show-input
-            />
+            <el-slider v-model="layout.cellPadding" :min="0.5" :max="4" :step="0.5" show-input />
           </el-form-item>
-
           <el-form-item label="字段名称列宽 (%)">
-            <el-slider
-              v-model="layout.labelWidth"
-              :min="15"
-              :max="65"
-              :step="1"
-              show-input
-            />
+            <el-slider v-model="layout.labelWidth" :min="15" :max="65" :step="1" show-input />
           </el-form-item>
-          
           <el-form-item label="二维码尺寸 (mm)">
-            <el-slider
-              v-model="layout.qrSize"
-              :min="15"
-              :max="30"
-              :step="1"
-              show-input
-            />
+            <el-slider v-model="layout.qrSize" :min="15" :max="30" :step="1" show-input />
           </el-form-item>
-          
           <el-divider />
-
           <div class="layout-description">
-            <p>
-              纸张尺寸：100 × 150 mm
-            </p>
-            <p>
-              调整滑块时，工艺卡实时更新。
-            </p>
-            <p>
-              设置会自动保存。
-            </p>
+            <p>纸张尺寸：100 × 150 mm</p>
+            <p>每条记录打印为独立的一页。</p>
+            <p>设置会自动保存。</p>
           </div>
-
         </el-form>
       </el-tab-pane>
-
     </el-tabs>
   </el-dialog>
 
-  <!-- Process card -->
-  <div
-    v-if="currentRecord"
-    id="my-print-container"
-    class="my-grid-table"
-    :style="{
-      '--card-font-size': layout.fontSize + 'pt',
-      '--card-cell-padding': layout.cellPadding + 'mm',
-      '--card-label-width': layout.labelWidth + '%',
-      '--card-qr-size': layout.qrSize + 'mm'
-    }"
-  >
+  <div v-if="currentRecords.length" id="my-print-container">
     <div
-      v-for="field in printFields"
-      :key="field.id"
-      class="my-grid-row"
+      v-for="(fields, cardIndex) in currentRecords"
+      :key="cardIndex"
+      class="print-sheet"
+      :style="{
+        '--card-font-size': layout.fontSize + 'pt',
+        '--card-cell-padding': layout.cellPadding + 'mm',
+        '--card-label-width': layout.labelWidth + '%',
+        '--card-qr-size': layout.qrSize + 'mm'
+      }"
     >
-      <!-- Field label -->
-      <div class="my-grid-cell label-cell">
-        {{ field.name }}
-      </div>
-
-      <!-- Field value -->
-      <div class="my-grid-cell value-cell">
-
-        <!-- Image attachment -->
-        <template
-          v-if="field.type === FieldType.Attachment"
-        >
-          <img
-            v-for="(url, index) in field.value"
-            :key="index"
-            :src="url"
-            class="qr-image"
-            alt="附件图片"
-          />
-        </template>
-
-        <!-- Text or other fields -->
-        <template v-else>
-          {{ field.value }}
-        </template>
-
+      <div class="my-grid-table">
+        <div v-for="field in fields" :key="field.id" class="my-grid-row">
+          <div class="my-grid-cell label-cell">{{ field.name }}</div>
+          <div class="my-grid-cell value-cell">
+            <template v-if="field.type === FieldType.Attachment">
+              <img
+                v-for="(url, imageIndex) in field.value"
+                :key="imageIndex"
+                :src="url"
+                class="qr-image"
+                alt="附件图片"
+              />
+            </template>
+            <template v-else>{{ field.value }}</template>
+          </div>
+        </div>
       </div>
     </div>
   </div>
 </template>
 
 <style scoped>
-/* --------------------------------------
-   Live card preview
--------------------------------------- */
+.card-count {
+  font-size: 12px;
+  color: #606266;
+}
+
+.print-sheet {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 12px;
+}
 
 .my-grid-table {
   display: flex;
   flex-direction: column;
-
   width: 100%;
   box-sizing: border-box;
-
-  font-family:
-    Arial,
-    "Microsoft YaHei",
-    sans-serif;
-
+  font-family: Arial, "Microsoft YaHei", sans-serif;
   font-size: var(--card-font-size, 9pt);
   line-height: 1.25;
   letter-spacing: 0;
-
   border: 1px solid #000;
   border-radius: 0;
   background: #fff;
 }
 
-/* --------------------------------------
-   Two-column row
--------------------------------------- */
-
 .my-grid-row {
   display: grid;
-
-  grid-template-columns:
-    var(--card-label-width, 32%)
-    minmax(0, 1fr);
-
+  grid-template-columns: var(--card-label-width, 32%) minmax(0, 1fr);
   width: 100%;
   box-sizing: border-box;
-
   border-bottom: 1px solid #000;
-
   break-inside: avoid;
 }
-
-.my-grid-row:last-child {
-  border-bottom: none;
-}
-
-/* --------------------------------------
-   Cells
--------------------------------------- */
+.my-grid-row:last-child { border-bottom: none; }
 
 .my-grid-cell {
   min-width: 0;
   box-sizing: border-box;
-
-  padding:
-    var(--card-cell-padding, 1.5mm)
-    1.5mm;
-
+  padding: var(--card-cell-padding, 1.5mm) 1.5mm;
   background: #fff;
-
   overflow-wrap: anywhere;
   word-break: break-word;
 }
-
-.label-cell {
-  border-right: 1px solid #000;
-  font-weight: 500;
-}
-
-.value-cell {
-  font-weight: 400;
-}
-
-/* --------------------------------------
-   Image / QR code
--------------------------------------- */
+.label-cell { border-right: 1px solid #000; font-weight: 500; }
+.value-cell { font-weight: 400; }
 
 .qr-image {
   display: block;
@@ -324,58 +200,38 @@ watch(
   object-fit: contain;
 }
 
-/* --------------------------------------
-   Layout settings information
--------------------------------------- */
-
-.layout-description {
-  font-size: 12px;
-  color: #909399;
-  line-height: 1.6;
-}
-
-.layout-description p {
-  margin: 4px 0;
-}
-
-/* --------------------------------------
-   Print styles
--------------------------------------- */
+.layout-description { font-size: 12px; color: #909399; line-height: 1.6; }
+.layout-description p { margin: 4px 0; }
 
 @media print {
-  .my-tools-container {
-    display: none !important;
+  .my-tools-container { display: none !important; }
+
+  .print-sheet {
+    width: 92mm;
+    max-width: 92mm;
+    margin: 0 auto;
+    break-inside: avoid;
+    page-break-inside: avoid;
+    break-after: page;
+    page-break-after: always;
+  }
+  .print-sheet:last-child {
+    break-after: auto;
+    page-break-after: auto;
   }
 
   .my-grid-table {
     width: 92mm;
     max-width: 92mm;
-
-    box-sizing: border-box;
-
     font-size: var(--card-font-size, 9pt);
-
     border: 1px solid #000;
-    border-radius: 0;
-
-    margin-left: auto;
-    margin-right: auto;
+    margin: 0;
   }
-
   .my-grid-row {
-    grid-template-columns:
-      var(--card-label-width, 32%)
-      minmax(0, 1fr);
-
+    grid-template-columns: var(--card-label-width, 32%) minmax(0, 1fr);
     break-inside: avoid;
   }
-
-  .my-grid-cell {
-    padding:
-      var(--card-cell-padding, 1.5mm)
-      1.5mm;
-  }
-
+  .my-grid-cell { padding: var(--card-cell-padding, 1.5mm) 1.5mm; }
   .qr-image {
     width: var(--card-qr-size, 20mm);
     height: var(--card-qr-size, 20mm);
@@ -386,26 +242,22 @@ watch(
 </style>
 
 <style>
-/* Print paper settings are global, not scoped */
-
 @page {
   size: 100mm 150mm;
   margin: 4mm;
 }
 
 @media print {
-  html,
-  body,
-  #app {
+  html, body, #app {
     margin: 0 !important;
     padding: 0 !important;
   }
 
-  .my-tools-container,
-  .el-overlay {
+  .my-tools-container, .el-overlay {
     display: none !important;
   }
 
+  /* Hide the injected Netlify badge in PDFs. */
   body > :not(#app) {
     display: none !important;
   }
