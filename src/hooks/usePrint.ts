@@ -7,6 +7,27 @@ const SETTING_KEY = 'my_print_setting';
 
 type SelectedRecordLabel = { id: string; label: string };
 
+// Sort production orders naturally and the sequence after # numerically.
+// Examples: GD-00144#2 before GD-00144#10, and GD-00144 before GD-00145.
+const naturalOrder = new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' });
+
+const compareCardLabels = (left: string, right: string): number => {
+  const a = /^(.*)#(\d+)$/.exec(left.trim());
+  const b = /^(.*)#(\d+)$/.exec(right.trim());
+
+  // Unrecognizable identifiers stay at the end, in their original selection order.
+  if (!a && !b) return 0;
+  if (!a) return 1;
+  if (!b) return -1;
+
+  const orderComparison = naturalOrder.compare(a[1], b[1]);
+  if (orderComparison !== 0) return orderComparison;
+
+  const sequenceA = BigInt(a[2]);
+  const sequenceB = BigInt(b[2]);
+  return sequenceA < sequenceB ? -1 : sequenceA > sequenceB ? 1 : 0;
+};
+
 const usePrint = () => {
   const selectedRecordIds = ref<string[]>([]);
   const selectedRecordLabels = ref<SelectedRecordLabel[]>([]);
@@ -102,8 +123,15 @@ const usePrint = () => {
         labels.push({ id: recordId, label: label.trim() || `记录 ${index + 1}` });
       }
 
-      currentRecords.value = loadedCards;
-      selectedRecordLabels.value = labels;
+      // Sort once, then update IDs, labels and cards in precisely the same order.
+      // This also determines print/PDF order and management-dialog order.
+      const sorted = labels
+        .map((item, index) => ({ item, index, card: loadedCards[index] }))
+        .sort((a, b) => compareCardLabels(a.item.label, b.item.label) || a.index - b.index);
+
+      selectedRecordIds.value = sorted.map(entry => entry.item.id);
+      selectedRecordLabels.value = sorted.map(entry => entry.item);
+      currentRecords.value = sorted.map(entry => entry.card);
     } catch (error) {
       console.error('Failed to load process cards:', error);
       bitable.ui.showToast({ toastType: ToastType.error, message: '读取工艺卡失败，请重试' });
