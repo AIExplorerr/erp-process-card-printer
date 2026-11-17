@@ -13,6 +13,8 @@ const {
   currentRecords,
   selectedRecordIds,
   selectedRecordLabels,
+  loadProgress,
+  restoreNotice,
   isLoading,
   isSettingPanelShow,
   settingList
@@ -20,6 +22,19 @@ const {
 
 const isManagePanelShow = ref(false);
 const managedRecordIds = ref<string[]>([]);
+const selectAllManaged = () => { managedRecordIds.value = selectedRecordIds.value.slice(); };
+const deselectAllManaged = () => { managedRecordIds.value = []; };
+const batchGroups = computed(() => {
+  const groups = new Map<string, number>();
+  for (const record of selectedRecordLabels.value) {
+    const label = record.label;
+    const group = label.includes('#') ? label.slice(0, label.lastIndexOf('#')) : '(未分类)';
+    groups.set(group, (groups.get(group) ?? 0) + 1);
+  }
+  return [...groups.entries()].map(([name, count]) => ({name, count}));
+});
+const missingIdentifierItems = computed(() => printItems.value.filter(item => /^记录 \d+$/.test(item.label)));
+
 const isPrintConfirmShow = ref(false);
 const printInProgress = ref(false);
 const printValidOnly = ref(false);
@@ -50,7 +65,8 @@ const printItems = computed(() => currentRecords.value.map((fields, index) => {
     id: selectedRecordIds.value[index] ?? `record-${index}`,
     label: selectedRecordLabels.value[index]?.label ?? `记录 ${index + 1}`,
     fields,
-    hasQr: urls.length > 0
+    hasQr: urls.length > 0,
+    qrUrls: urls
   };
 }));
 
@@ -81,7 +97,8 @@ const resetPrintMode = () => {
 const runPrint = async (onlyValid: boolean) => {
   if (printInProgress.value) return;
   if (onlyValid && !completeQrItems.value.length) return;
-  if (!onlyValid && missingQrItems.value.length) return; // Never silently print incomplete cards.
+  if (!onlyValid && (missingQrItems.value.length || missingIdentifierItems.value.length)) return;
+  if (onlyValid && completeQrItems.value.some(item => /^记录 \d+$/.test(item.label))) return;
 
   isPrintConfirmShow.value = false;
   printInProgress.value = true;
@@ -97,7 +114,7 @@ const runPrint = async (onlyValid: boolean) => {
       const done = (ok: boolean) => resolve(ok);
       img.addEventListener('load', () => done(true), { once: true });
       img.addEventListener('error', () => done(false), { once: true });
-      setTimeout(() => done(false), 8000);
+      setTimeout(() => done(false), 12000);
     });
   }));
 
@@ -108,7 +125,11 @@ const runPrint = async (onlyValid: boolean) => {
   }
 
   // In Feishu's embedded browser, afterprint normally fires when preview closes.
-  window.print();
+  try { window.print(); }
+  catch (error) {
+    resetPrintMode();
+    bitable.ui.showToast({ toastType: ToastType.error, message: '无法打开打印预览，请重试' });
+  }
 };
 
 onBeforeMount(async () => {
@@ -142,13 +163,15 @@ watch(layout, async value => {
 
 <template>
   <div class="my-tools-container">
-    <el-button :loading="isLoading" @click="selectRecord">添加记录</el-button>
+    <el-button :loading="isLoading" :disabled="printInProgress" @click="selectRecord">添加记录</el-button>
     <el-button :disabled="isLoading || printInProgress || currentRecords.length === 0" @click="openManagePanel">
       管理已选 ({{ currentRecords.length }})
     </el-button>
     <el-button :disabled="isLoading || printInProgress || currentRecords.length === 0" @click="openPrintConfirmation">打印</el-button>
-    <el-button @click="handleSetting">设置</el-button>
-    <span v-if="currentRecords.length" class="card-count">已选择 {{ currentRecords.length }} 条记录</span>
+    <el-button :disabled="isLoading || printInProgress" @click="handleSetting">设置</el-button>
+    <span v-if="currentRecords.length" class="card-count">已选 {{ currentRecords.length }} 张 · {{ batchGroups.length }} 组 · 预计 {{ currentRecords.length }} 页</span>
+    <span v-if="isLoading" class="card-count">读取中 {{ loadProgress.done }}/{{ loadProgress.total }}</span>
+    <span v-else-if="restoreNotice" class="card-count">{{ restoreNotice }}</span>
   </div>
 
   <el-dialog
@@ -161,6 +184,17 @@ watch(layout, async value => {
   >
     <p>当前选择 <strong>{{ printItems.length }}</strong> 张工艺卡，涉及 <strong>{{ printOrderCount }}</strong> 个编号组。</p>
     <p>已按周转单位编号自动排序。纸张尺寸：<strong>100 × 150 mm</strong>，每张工艺卡独占一页。</p>
+    <el-alert
+      v-if="missingIdentifierItems.length"
+      title="部分记录缺少周转单位编号"
+      type="error"
+      :closable="false"
+      show-icon
+      class="identifier-warning"
+    >
+      <div>请先检查以下记录的周转单位编号，避免打印后无法识别：</div>
+      <ul><li v-for="item in missingIdentifierItems" :key="item.id">{{ item.label }}（{{ item.id }}）</li></ul>
+    </el-alert>
     <el-alert
       v-if="missingQrItems.length"
       title="发现缺少工艺卡二维码的记录"
@@ -182,10 +216,10 @@ watch(layout, async value => {
       <el-button
         v-if="missingQrItems.length"
         type="primary"
-        :disabled="!completeQrItems.length"
+        :disabled="!completeQrItems.length || missingIdentifierItems.length > 0"
         @click="runPrint(true)"
       >仅打印完整记录 ({{ completeQrItems.length }})</el-button>
-      <el-button v-else type="primary" @click="runPrint(false)">确认打印 ({{ printItems.length }})</el-button>
+      <el-button v-else type="primary" :disabled="missingIdentifierItems.length > 0" @click="runPrint(false)">确认打印 ({{ printItems.length }})</el-button>
     </template>
   </el-dialog>
 
@@ -200,6 +234,14 @@ watch(layout, async value => {
     <p class="manage-hint">已按周转单位编号自动排序（工单编号 → #后数字）。此列表顺序即最终打印顺序。</p>
     <p class="manage-hint">取消勾选不需要打印的记录，然后点击「应用选择」。</p>
     <div class="manage-summary">当前批次 {{ selectedRecordIds.length }} 条，保留 {{ managedRecordIds.length }} 条</div>
+    <div class="manage-toolbar">
+      <el-button size="small" @click="selectAllManaged">全选</el-button>
+      <el-button size="small" @click="deselectAllManaged">全不选</el-button>
+      <span>共 {{ batchGroups.length }} 个编号组</span>
+    </div>
+    <div class="batch-group-summary">
+      <span v-for="group in batchGroups" :key="group.name">{{ group.name }}：{{ group.count }} 张</span>
+    </div>
     <el-checkbox-group v-model="managedRecordIds" class="managed-record-list">
       <el-checkbox
         v-for="(record, index) in selectedRecordLabels"
@@ -297,6 +339,9 @@ watch(layout, async value => {
 
 <style scoped>
 .card-count { font-size: 12px; color: #606266; }
+.manage-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 8px 0; font-size: 12px; }
+.batch-group-summary { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-bottom: 12px; font-size: 12px; color: #606266; }
+.identifier-warning { margin-bottom: 12px; }
 .manage-hint { margin: 0 0 8px; color: #606266; font-size: 13px; }
 .manage-summary { margin-bottom: 12px; font-size: 13px; font-weight: 500; }
 .managed-record-list { display: flex; flex-direction: column; gap: 8px; max-height: 350px; overflow-y: auto; }
