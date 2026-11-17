@@ -106,16 +106,17 @@ watch(layout, async value => {
     append-to-body
     class="manage-records-dialog"
   >
+    <p class="manage-hint">已按周转单位编号自动排序（工单编号 → #后数字）。此列表顺序即最终打印顺序。</p>
     <p class="manage-hint">取消勾选不需要打印的记录，然后点击「应用选择」。</p>
     <div class="manage-summary">当前批次 {{ selectedRecordIds.length }} 条，保留 {{ managedRecordIds.length }} 条</div>
     <el-checkbox-group v-model="managedRecordIds" class="managed-record-list">
       <el-checkbox
-        v-for="record in selectedRecordLabels"
+        v-for="(record, index) in selectedRecordLabels"
         :key="record.id"
         :value="record.id"
         class="managed-record-item"
       >
-        {{ record.label }}
+        {{ index + 1 }}. {{ record.label }}
       </el-checkbox>
     </el-checkbox-group>
     <template #footer>
