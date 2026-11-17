@@ -4,6 +4,7 @@ import { ref } from 'vue';
 import type { IFieldMetaSettings, IFieldMetaWithValue } from '../types';
 
 const SETTING_KEY = 'my_print_setting';
+const BATCH_KEY = 'erp_saved_print_batch_v1';
 
 type SelectedRecordLabel = { id: string; label: string };
 
@@ -36,11 +37,24 @@ const usePrint = () => {
   const isSettingPanelShow = ref(false);
   const settingList = ref<IFieldMetaSettings[]>([]);
   const isLoading = ref(false);
+  const loadProgress = ref({ done: 0, total: 0 });
+  const activeTableId = ref('');
+  const restoreNotice = ref('');
+  let loadGeneration = 0;
 
   const init = async () => {
     const table = await bitable.base.getActiveTable();
+    activeTableId.value = table.id;
     fieldList.value = await table.getFieldMetaList();
     await getSettingList();
+    try {
+      const saved = await bitable.bridge.getData<{tableId: string; recordIds: string[]}>(BATCH_KEY);
+      if (saved?.tableId === table.id && Array.isArray(saved.recordIds) && saved.recordIds.length) {
+        selectedRecordIds.value = [...new Set(saved.recordIds.filter((id): id is string => typeof id === 'string' && !!id))];
+        await loadSelectedRecords();
+        if (currentRecords.value.length) restoreNotice.value = `已恢复 ${currentRecords.value.length} 条上次选择的记录`;
+      }
+    } catch (error) { console.warn('Failed to restore saved batch:', error); }
   };
 
   const getSettingList = async () => {
@@ -67,6 +81,15 @@ const usePrint = () => {
     settingList.value = [...savedSettings, ...newFields];
   };
 
+  const persistBatch = async () => {
+    try {
+      await bitable.bridge.setData(BATCH_KEY, {
+        tableId: activeTableId.value,
+        recordIds: [...selectedRecordIds.value]
+      });
+    } catch (error) { console.warn('Failed to save batch:', error); }
+  };
+
   const loadSelectedRecords = async () => {
     if (selectedRecordIds.value.length === 0) {
       currentRecords.value = [];
@@ -74,7 +97,9 @@ const usePrint = () => {
       return;
     }
 
+    const generation = ++loadGeneration;
     isLoading.value = true;
+    loadProgress.value = { done: 0, total: selectedRecordIds.value.length };
     try {
       const table = await bitable.base.getActiveTable();
       const orderedSettings = settingList.value.filter(setting => !setting.hidden);
@@ -86,7 +111,8 @@ const usePrint = () => {
       const labels: SelectedRecordLabel[] = [];
 
       // Load sequentially to avoid overwhelming Feishu with requests.
-      for (const [index, recordId] of selectedRecordIds.value.entries()) {
+      for (const [index, recordId] of [...selectedRecordIds.value].entries()) {
+        if (generation !== loadGeneration) return;
         const values = await Promise.all(
           orderedSettings.map(async setting => {
             const field = fieldMetaMap.get(setting.fieldId);
@@ -121,6 +147,7 @@ const usePrint = () => {
             : await table.getCellString(identifierField.id, recordId);
         }
         labels.push({ id: recordId, label: label.trim() || `记录 ${index + 1}` });
+        loadProgress.value = { done: index + 1, total: loadProgress.value.total };
       }
 
       // Sort once, then update IDs, labels and cards in precisely the same order.
@@ -129,14 +156,16 @@ const usePrint = () => {
         .map((item, index) => ({ item, index, card: loadedCards[index] }))
         .sort((a, b) => compareCardLabels(a.item.label, b.item.label) || a.index - b.index);
 
+      if (generation !== loadGeneration) return;
       selectedRecordIds.value = sorted.map(entry => entry.item.id);
       selectedRecordLabels.value = sorted.map(entry => entry.item);
       currentRecords.value = sorted.map(entry => entry.card);
+      await persistBatch();
     } catch (error) {
       console.error('Failed to load process cards:', error);
-      bitable.ui.showToast({ toastType: ToastType.error, message: '读取工艺卡失败，请重试' });
+      bitable.ui.showToast({ toastType: ToastType.error, message: '读取工艺卡失败，请重试；原批次保留' });
     } finally {
-      isLoading.value = false;
+      if (generation === loadGeneration) isLoading.value = false;
     }
   };
 
@@ -173,6 +202,7 @@ const usePrint = () => {
     selectedRecordIds.value = indices.map(item => item.id);
     currentRecords.value = indices.map(item => currentRecords.value[item.index]);
     selectedRecordLabels.value = indices.map(item => selectedRecordLabels.value[item.index]);
+    void persistBatch();
   };
 
   const clearSelection = () => {
@@ -180,6 +210,7 @@ const usePrint = () => {
     selectedRecordIds.value = [];
     currentRecords.value = [];
     selectedRecordLabels.value = [];
+    void persistBatch();
   };
 
   const handleSettingListUpdate = async (list: IFieldMetaSettings[], showToast = true) => {
@@ -210,6 +241,8 @@ const usePrint = () => {
   return {
     selectedRecordIds,
     selectedRecordLabels,
+    loadProgress,
+    restoreNotice,
     currentRecords,
     isLoading,
     isSettingPanelShow,
