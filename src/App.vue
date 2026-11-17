@@ -1,13 +1,12 @@
 <script setup lang="ts">
-import { bitable, FieldType } from '@lark-base-open/js-sdk';
-import { onBeforeMount, ref, watch } from 'vue';
+import { bitable, FieldType, ToastType } from '@lark-base-open/js-sdk';
+import { computed, nextTick, onBeforeMount, onBeforeUnmount, ref, watch } from 'vue';
 import usePrint from './hooks/usePrint';
 
 const {
   selectRecord,
   retainSelectedRecords,
   clearSelection,
-  handlePrint,
   init,
   handleSetting,
   handleSettingListUpdate,
@@ -21,41 +20,104 @@ const {
 
 const isManagePanelShow = ref(false);
 const managedRecordIds = ref<string[]>([]);
+const isPrintConfirmShow = ref(false);
+const printInProgress = ref(false);
+const printValidOnly = ref(false);
 
 const openManagePanel = () => {
   managedRecordIds.value = [...selectedRecordIds.value];
   isManagePanelShow.value = true;
 };
-
 const applyManagedSelection = () => {
   retainSelectedRecords(managedRecordIds.value);
   isManagePanelShow.value = false;
 };
-
 const confirmClearSelection = () => {
   clearSelection();
   managedRecordIds.value = [];
   isManagePanelShow.value = false;
 };
 
-const LAYOUT_KEY = 'erp_process_card_layout_v1';
-const layout = ref({
-  fontSize: 9,
-  cellPadding: 1.5,
-  labelWidth: 32,
-  qrSize: 20
-});
+// Find the attachment that is actually printed on each process card.
+// Checking by field name avoids mistaking unrelated attachments for the QR code.
+const QR_FIELD_NAME = '工艺卡二维码';
+const printItems = computed(() => currentRecords.value.map((fields, index) => {
+  const qr = fields.find(field => field.name === QR_FIELD_NAME && field.type === FieldType.Attachment);
+  const urls: string[] = Array.isArray(qr?.value)
+    ? qr.value.filter((url: unknown): url is string => typeof url === 'string' && url.trim().length > 0)
+    : [];
+  return {
+    id: selectedRecordIds.value[index] ?? `record-${index}`,
+    label: selectedRecordLabels.value[index]?.label ?? `记录 ${index + 1}`,
+    fields,
+    hasQr: urls.length > 0
+  };
+}));
+
+const missingQrItems = computed(() => printItems.value.filter(item => !item.hasQr));
+const completeQrItems = computed(() => printItems.value.filter(item => item.hasQr));
+const printOrderCount = computed(() => new Set(
+  printItems.value.map(item => item.label.includes('#')
+    ? item.label.slice(0, item.label.lastIndexOf('#')).trim()
+    : item.label.trim())
+).size);
+
+// Normally show all cards. Only reduce the rendered set when explicitly printing
+// the complete-QR subset. This keeps page breaks correct, with no blank end page.
+const visiblePrintItems = computed(() => printValidOnly.value
+  ? completeQrItems.value
+  : printItems.value);
+
+const openPrintConfirmation = () => {
+  if (isLoading.value || printInProgress.value || !printItems.value.length) return;
+  isPrintConfirmShow.value = true;
+};
+
+const resetPrintMode = () => {
+  printInProgress.value = false;
+  printValidOnly.value = false;
+};
+
+const runPrint = async (onlyValid: boolean) => {
+  if (printInProgress.value) return;
+  if (onlyValid && !completeQrItems.value.length) return;
+  if (!onlyValid && missingQrItems.value.length) return; // Never silently print incomplete cards.
+
+  isPrintConfirmShow.value = false;
+  printInProgress.value = true;
+  printValidOnly.value = onlyValid;
+  await nextTick();
+
+  // QR URLs may be valid while images are still loading. Wait for the actual
+  // displayed images to finish before opening the print preview.
+  const images = Array.from(document.querySelectorAll<HTMLImageElement>('#my-print-container .qr-image'));
+  const loaded = await Promise.all(images.map(img => {
+    if (img.complete) return Promise.resolve(img.naturalWidth > 0);
+    return new Promise<boolean>(resolve => {
+      const done = (ok: boolean) => resolve(ok);
+      img.addEventListener('load', () => done(true), { once: true });
+      img.addEventListener('error', () => done(false), { once: true });
+      setTimeout(() => done(false), 8000);
+    });
+  }));
+
+  if (loaded.some(ok => !ok)) {
+    resetPrintMode();
+    bitable.ui.showToast({ toastType: ToastType.error, message: '部分二维码图片未能加载，请检查后重试' });
+    return;
+  }
+
+  // In Feishu's embedded browser, afterprint normally fires when preview closes.
+  window.print();
+};
 
 onBeforeMount(async () => {
+  window.addEventListener('afterprint', resetPrintMode);
   await init();
   try {
     const saved = await bitable.bridge.getData<{
-      fontSize?: number;
-      cellPadding?: number;
-      labelWidth?: number;
-      qrSize?: number;
-    }>(LAYOUT_KEY);
-
+      fontSize?: number; cellPadding?: number; labelWidth?: number; qrSize?: number;
+    }>('erp_process_card_layout_v1');
     if (saved) {
       layout.value = {
         fontSize: saved.fontSize ?? 9,
@@ -68,36 +130,65 @@ onBeforeMount(async () => {
     console.error('Failed to load layout settings:', error);
   }
 });
+onBeforeUnmount(() => window.removeEventListener('afterprint', resetPrintMode));
 
+const LAYOUT_KEY = 'erp_process_card_layout_v1';
+const layout = ref({ fontSize: 9, cellPadding: 1.5, labelWidth: 32, qrSize: 20 });
 watch(layout, async value => {
-  try {
-    await bitable.bridge.setData(LAYOUT_KEY, { ...value });
-  } catch (error) {
-    console.error('Failed to save layout settings:', error);
-  }
+  try { await bitable.bridge.setData(LAYOUT_KEY, { ...value }); }
+  catch (error) { console.error('Failed to save layout settings:', error); }
 }, { deep: true });
 </script>
 
 <template>
   <div class="my-tools-container">
-    <el-button :loading="isLoading" @click="selectRecord">
-      添加记录
-    </el-button>
-    <el-button :disabled="isLoading || currentRecords.length === 0" @click="openManagePanel">
+    <el-button :loading="isLoading" @click="selectRecord">添加记录</el-button>
+    <el-button :disabled="isLoading || printInProgress || currentRecords.length === 0" @click="openManagePanel">
       管理已选 ({{ currentRecords.length }})
     </el-button>
-    <el-button :disabled="isLoading || currentRecords.length === 0" @click="handlePrint">
-      打印
-    </el-button>
-    <el-button @click="handleSetting">
-      设置
-    </el-button>
-    <span v-if="currentRecords.length" class="card-count">
-      已选择 {{ currentRecords.length }} 条记录
-    </span>
+    <el-button :disabled="isLoading || printInProgress || currentRecords.length === 0" @click="openPrintConfirmation">打印</el-button>
+    <el-button @click="handleSetting">设置</el-button>
+    <span v-if="currentRecords.length" class="card-count">已选择 {{ currentRecords.length }} 条记录</span>
   </div>
 
-  <!-- This dialog is fully controlled by our plugin, so selections remain visible. -->
+  <el-dialog
+    v-model="isPrintConfirmShow"
+    title="打印前确认"
+    width="520px"
+    top="5vh"
+    append-to-body
+    class="print-confirm-dialog"
+  >
+    <p>当前选择 <strong>{{ printItems.length }}</strong> 张工艺卡，涉及 <strong>{{ printOrderCount }}</strong> 个编号组。</p>
+    <p>已按周转单位编号自动排序。纸张尺寸：<strong>100 × 150 mm</strong>，每张工艺卡独占一页。</p>
+    <el-alert
+      v-if="missingQrItems.length"
+      title="发现缺少工艺卡二维码的记录"
+      type="warning"
+      :closable="false"
+      show-icon
+    >
+      <div>共 {{ missingQrItems.length }} 条缺少可用的二维码附件链接：</div>
+      <ul class="qr-warning-list">
+        <li v-for="item in missingQrItems" :key="item.id">{{ item.label }}</li>
+      </ul>
+      <div>请返回飞书补齐二维码，或仅打印其余 {{ completeQrItems.length }} 张记录。</div>
+    </el-alert>
+    <el-alert v-else title="二维码附件检查通过" type="success" :closable="false" show-icon>
+      {{ printItems.length }} 条记录均有工艺卡二维码附件链接；打印前仍会检查图片是否加载成功。
+    </el-alert>
+    <template #footer>
+      <el-button @click="isPrintConfirmShow = false">取消</el-button>
+      <el-button
+        v-if="missingQrItems.length"
+        type="primary"
+        :disabled="!completeQrItems.length"
+        @click="runPrint(true)"
+      >仅打印完整记录 ({{ completeQrItems.length }})</el-button>
+      <el-button v-else type="primary" @click="runPrint(false)">确认打印 ({{ printItems.length }})</el-button>
+    </template>
+  </el-dialog>
+
   <el-dialog
     v-model="isManagePanelShow"
     title="管理已选记录"
@@ -115,9 +206,7 @@ watch(layout, async value => {
         :key="record.id"
         :value="record.id"
         class="managed-record-item"
-      >
-        {{ index + 1 }}. {{ record.label }}
-      </el-checkbox>
+      >{{ index + 1 }}. {{ record.label }}</el-checkbox>
     </el-checkbox-group>
     <template #footer>
       <div class="manage-actions">
@@ -127,9 +216,7 @@ watch(layout, async value => {
           cancel-button-text="取消"
           @confirm="confirmClearSelection"
         >
-          <template #reference>
-            <el-button type="danger" plain>清空选择</el-button>
-          </template>
+          <template #reference><el-button type="danger" plain>清空选择</el-button></template>
         </el-popconfirm>
         <span class="manage-action-spacer"></span>
         <el-button @click="isManagePanelShow = false">取消</el-button>
@@ -148,10 +235,7 @@ watch(layout, async value => {
   >
     <el-tabs model-value="fields">
       <el-tab-pane label="字段设置" name="fields">
-        <settings-panel
-          :list="settingList"
-          @update:list="handleSettingListUpdate"
-        />
+        <settings-panel :list="settingList" @update:list="handleSettingListUpdate" />
       </el-tab-pane>
       <el-tab-pane label="排版设置" name="layout">
         <el-form label-position="top">
@@ -180,8 +264,8 @@ watch(layout, async value => {
 
   <div v-if="currentRecords.length" id="my-print-container">
     <div
-      v-for="(fields, cardIndex) in currentRecords"
-      :key="selectedRecordIds[cardIndex]"
+      v-for="item in visiblePrintItems"
+      :key="item.id"
       class="print-sheet"
       :style="{
         '--card-font-size': layout.fontSize + 'pt',
@@ -191,7 +275,7 @@ watch(layout, async value => {
       }"
     >
       <div class="my-grid-table">
-        <div v-for="field in fields" :key="field.id" class="my-grid-row">
+        <div v-for="field in item.fields" :key="field.id" class="my-grid-row">
           <div class="my-grid-cell label-cell">{{ field.name }}</div>
           <div class="my-grid-cell value-cell">
             <template v-if="field.type === FieldType.Attachment">
@@ -219,50 +303,29 @@ watch(layout, async value => {
 .managed-record-item { display: flex; width: 100%; margin: 0 !important; }
 .manage-actions { display: flex; align-items: center; gap: 8px; }
 .manage-action-spacer { flex: 1; }
+.qr-warning-list { max-height: 160px; overflow-y: auto; margin: 8px 0; padding-left: 20px; }
 
-.print-sheet {
-  width: 100%;
-  box-sizing: border-box;
-  margin-bottom: 12px;
-}
+.print-sheet { width: 100%; box-sizing: border-box; margin-bottom: 12px; }
 .my-grid-table {
-  display: flex;
-  flex-direction: column;
-  width: 100%;
-  box-sizing: border-box;
+  display: flex; flex-direction: column; width: 100%; box-sizing: border-box;
   font-family: Arial, "Microsoft YaHei", sans-serif;
-  font-size: var(--card-font-size, 9pt);
-  line-height: 1.25;
-  letter-spacing: 0;
-  border: 1px solid #000;
-  border-radius: 0;
-  background: #fff;
+  font-size: var(--card-font-size, 9pt); line-height: 1.25; letter-spacing: 0;
+  border: 1px solid #000; border-radius: 0; background: #fff;
 }
 .my-grid-row {
-  display: grid;
-  grid-template-columns: var(--card-label-width, 32%) minmax(0, 1fr);
-  width: 100%;
-  box-sizing: border-box;
-  border-bottom: 1px solid #000;
-  break-inside: avoid;
+  display: grid; grid-template-columns: var(--card-label-width, 32%) minmax(0, 1fr);
+  width: 100%; box-sizing: border-box; border-bottom: 1px solid #000; break-inside: avoid;
 }
 .my-grid-row:last-child { border-bottom: none; }
 .my-grid-cell {
-  min-width: 0;
-  box-sizing: border-box;
-  padding: var(--card-cell-padding, 1.5mm) 1.5mm;
-  background: #fff;
-  overflow-wrap: anywhere;
-  word-break: break-word;
+  min-width: 0; box-sizing: border-box; padding: var(--card-cell-padding, 1.5mm) 1.5mm;
+  background: #fff; overflow-wrap: anywhere; word-break: break-word;
 }
 .label-cell { border-right: 1px solid #000; font-weight: 500; }
 .value-cell { font-weight: 400; }
 .qr-image {
-  display: block;
-  width: var(--card-qr-size, 20mm);
-  height: var(--card-qr-size, 20mm);
-  max-width: 100%;
-  object-fit: contain;
+  display: block; width: var(--card-qr-size, 20mm); height: var(--card-qr-size, 20mm);
+  max-width: 100%; object-fit: contain;
 }
 .layout-description { font-size: 12px; color: #909399; line-height: 1.6; }
 .layout-description p { margin: 4px 0; }
@@ -270,32 +333,22 @@ watch(layout, async value => {
 @media print {
   .my-tools-container { display: none !important; }
   .print-sheet {
-    width: 92mm;
-    max-width: 92mm;
-    margin: 0 auto;
-    break-inside: avoid;
-    page-break-inside: avoid;
-    break-after: page;
-    page-break-after: always;
+    width: 92mm; max-width: 92mm; margin: 0 auto;
+    break-inside: avoid; page-break-inside: avoid;
+    break-after: page; page-break-after: always;
   }
   .print-sheet:last-child { break-after: auto; page-break-after: auto; }
   .my-grid-table {
-    width: 92mm;
-    max-width: 92mm;
-    font-size: var(--card-font-size, 9pt);
-    border: 1px solid #000;
-    margin: 0;
+    width: 92mm; max-width: 92mm; font-size: var(--card-font-size, 9pt);
+    border: 1px solid #000; margin: 0;
   }
   .my-grid-row {
-    grid-template-columns: var(--card-label-width, 32%) minmax(0, 1fr);
-    break-inside: avoid;
+    grid-template-columns: var(--card-label-width, 32%) minmax(0, 1fr); break-inside: avoid;
   }
   .my-grid-cell { padding: var(--card-cell-padding, 1.5mm) 1.5mm; }
   .qr-image {
-    width: var(--card-qr-size, 20mm);
-    height: var(--card-qr-size, 20mm);
-    max-width: 100%;
-    object-fit: contain;
+    width: var(--card-qr-size, 20mm); height: var(--card-qr-size, 20mm);
+    max-width: 100%; object-fit: contain;
   }
 }
 </style>
