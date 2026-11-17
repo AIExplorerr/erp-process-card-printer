@@ -5,15 +5,38 @@ import usePrint from './hooks/usePrint';
 
 const {
   selectRecord,
+  retainSelectedRecords,
+  clearSelection,
   handlePrint,
   init,
   handleSetting,
   handleSettingListUpdate,
   currentRecords,
+  selectedRecordIds,
+  selectedRecordLabels,
   isLoading,
   isSettingPanelShow,
   settingList
 } = usePrint();
+
+const isManagePanelShow = ref(false);
+const managedRecordIds = ref<string[]>([]);
+
+const openManagePanel = () => {
+  managedRecordIds.value = [...selectedRecordIds.value];
+  isManagePanelShow.value = true;
+};
+
+const applyManagedSelection = () => {
+  retainSelectedRecords(managedRecordIds.value);
+  isManagePanelShow.value = false;
+};
+
+const confirmClearSelection = () => {
+  clearSelection();
+  managedRecordIds.value = [];
+  isManagePanelShow.value = false;
+};
 
 const LAYOUT_KEY = 'erp_process_card_layout_v1';
 const layout = ref({
@@ -58,7 +81,10 @@ watch(layout, async value => {
 <template>
   <div class="my-tools-container">
     <el-button :loading="isLoading" @click="selectRecord">
-      选择记录
+      添加记录
+    </el-button>
+    <el-button :disabled="isLoading || currentRecords.length === 0" @click="openManagePanel">
+      管理已选 ({{ currentRecords.length }})
     </el-button>
     <el-button :disabled="isLoading || currentRecords.length === 0" @click="handlePrint">
       打印
@@ -70,6 +96,46 @@ watch(layout, async value => {
       已选择 {{ currentRecords.length }} 条记录
     </span>
   </div>
+
+  <!-- This dialog is fully controlled by our plugin, so selections remain visible. -->
+  <el-dialog
+    v-model="isManagePanelShow"
+    title="管理已选记录"
+    width="600px"
+    top="5vh"
+    append-to-body
+    class="manage-records-dialog"
+  >
+    <p class="manage-hint">取消勾选不需要打印的记录，然后点击「应用选择」。</p>
+    <div class="manage-summary">当前批次 {{ selectedRecordIds.length }} 条，保留 {{ managedRecordIds.length }} 条</div>
+    <el-checkbox-group v-model="managedRecordIds" class="managed-record-list">
+      <el-checkbox
+        v-for="record in selectedRecordLabels"
+        :key="record.id"
+        :value="record.id"
+        class="managed-record-item"
+      >
+        {{ record.label }}
+      </el-checkbox>
+    </el-checkbox-group>
+    <template #footer>
+      <div class="manage-actions">
+        <el-popconfirm
+          title="确认清空当前批次的全部记录？"
+          confirm-button-text="确认清空"
+          cancel-button-text="取消"
+          @confirm="confirmClearSelection"
+        >
+          <template #reference>
+            <el-button type="danger" plain>清空选择</el-button>
+          </template>
+        </el-popconfirm>
+        <span class="manage-action-spacer"></span>
+        <el-button @click="isManagePanelShow = false">取消</el-button>
+        <el-button type="primary" @click="applyManagedSelection">应用选择</el-button>
+      </div>
+    </template>
+  </el-dialog>
 
   <el-dialog
     v-model="isSettingPanelShow"
@@ -86,7 +152,6 @@ watch(layout, async value => {
           @update:list="handleSettingListUpdate"
         />
       </el-tab-pane>
-
       <el-tab-pane label="排版设置" name="layout">
         <el-form label-position="top">
           <el-form-item label="字体大小 (pt)">
@@ -115,7 +180,7 @@ watch(layout, async value => {
   <div v-if="currentRecords.length" id="my-print-container">
     <div
       v-for="(fields, cardIndex) in currentRecords"
-      :key="cardIndex"
+      :key="selectedRecordIds[cardIndex]"
       class="print-sheet"
       :style="{
         '--card-font-size': layout.fontSize + 'pt',
@@ -146,17 +211,19 @@ watch(layout, async value => {
 </template>
 
 <style scoped>
-.card-count {
-  font-size: 12px;
-  color: #606266;
-}
+.card-count { font-size: 12px; color: #606266; }
+.manage-hint { margin: 0 0 8px; color: #606266; font-size: 13px; }
+.manage-summary { margin-bottom: 12px; font-size: 13px; font-weight: 500; }
+.managed-record-list { display: flex; flex-direction: column; gap: 8px; max-height: 350px; overflow-y: auto; }
+.managed-record-item { display: flex; width: 100%; margin: 0 !important; }
+.manage-actions { display: flex; align-items: center; gap: 8px; }
+.manage-action-spacer { flex: 1; }
 
 .print-sheet {
   width: 100%;
   box-sizing: border-box;
   margin-bottom: 12px;
 }
-
 .my-grid-table {
   display: flex;
   flex-direction: column;
@@ -170,7 +237,6 @@ watch(layout, async value => {
   border-radius: 0;
   background: #fff;
 }
-
 .my-grid-row {
   display: grid;
   grid-template-columns: var(--card-label-width, 32%) minmax(0, 1fr);
@@ -180,7 +246,6 @@ watch(layout, async value => {
   break-inside: avoid;
 }
 .my-grid-row:last-child { border-bottom: none; }
-
 .my-grid-cell {
   min-width: 0;
   box-sizing: border-box;
@@ -191,7 +256,6 @@ watch(layout, async value => {
 }
 .label-cell { border-right: 1px solid #000; font-weight: 500; }
 .value-cell { font-weight: 400; }
-
 .qr-image {
   display: block;
   width: var(--card-qr-size, 20mm);
@@ -199,13 +263,11 @@ watch(layout, async value => {
   max-width: 100%;
   object-fit: contain;
 }
-
 .layout-description { font-size: 12px; color: #909399; line-height: 1.6; }
 .layout-description p { margin: 4px 0; }
 
 @media print {
   .my-tools-container { display: none !important; }
-
   .print-sheet {
     width: 92mm;
     max-width: 92mm;
@@ -215,11 +277,7 @@ watch(layout, async value => {
     break-after: page;
     page-break-after: always;
   }
-  .print-sheet:last-child {
-    break-after: auto;
-    page-break-after: auto;
-  }
-
+  .print-sheet:last-child { break-after: auto; page-break-after: auto; }
   .my-grid-table {
     width: 92mm;
     max-width: 92mm;
@@ -242,24 +300,11 @@ watch(layout, async value => {
 </style>
 
 <style>
-@page {
-  size: 100mm 150mm;
-  margin: 4mm;
-}
-
+@page { size: 100mm 150mm; margin: 4mm; }
 @media print {
-  html, body, #app {
-    margin: 0 !important;
-    padding: 0 !important;
-  }
-
-  .my-tools-container, .el-overlay {
-    display: none !important;
-  }
-
-  /* Hide the injected Netlify badge in PDFs. */
-  body > :not(#app) {
-    display: none !important;
-  }
+  html, body, #app { margin: 0 !important; padding: 0 !important; }
+  .my-tools-container, .el-overlay { display: none !important; }
+  /* Hide the injected Netlify badge in PDF output. */
+  body > :not(#app) { display: none !important; }
 }
 </style>
