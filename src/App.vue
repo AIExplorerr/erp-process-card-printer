@@ -405,5 +405,9 @@ watch(
   .el-overlay {
     display: none !important;
   }
+
+  body > :not(#app) {
+    display: none !important;
+  }
 }
 </style>
