@@ -2,7 +2,7 @@
 import { bitable, FieldType, ToastType } from '@lark-base-open/js-sdk';
 import { computed, nextTick, onBeforeMount, onBeforeUnmount, ref, watch } from 'vue';
 import usePrint from './hooks/usePrint';
-import { confirmPrintedRecords, getPrintHistory, inspectPendingPrintJob } from './hooks/usePrintStatus';
+import { confirmPrintedRecords, getPrintHistory, inspectPendingPrintJob, verifyManualLateConfirmation } from './hooks/usePrintStatus';
 import type { PrintHistoryRecord } from './hooks/usePrintStatus';
 import { getOperatorStorageKey, printOperatorId } from './hooks/usePrint';
 
@@ -74,11 +74,28 @@ const operatorIdentity = computed(() => printOperatorId.value || '用户身份�
 const pendingRestored = ref(false);
 const hadWriteAttempt = ref(false);
 const pendingSaveError = ref('');
-type PendingJob = { jobId: string; recordIds: string[]; selectedIds: string[]; hadWriteAttempt: boolean };
+type PendingJob = { jobId: string; recordIds: string[]; selectedIds: string[]; hadWriteAttempt: boolean; source?: 'preview' | 'manual' };
+type DeferredSubmission = { recordId: string; jobId: string; submittedAt: number };
+const DEFERRED_KEY = 'erp_deferred_print_submission_v1';
+const deferredSubmissions = ref<DeferredSubmission[]>([]);
+const pendingSource = ref<'preview' | 'manual'>('preview');
+const deferredRecord = (id: string) => deferredSubmissions.value.find(item => item.recordId === id);
+const saveDeferredSubmissions = async (items: DeferredSubmission[]) => {
+  const ok = await bitable.bridge.setData(getOperatorStorageKey(DEFERRED_KEY), items);
+  if (ok === false) throw new Error('打印提交凭证保存失败；请勿重新打印或重复确认');
+  deferredSubmissions.value = items;
+};
+const restoreDeferredSubmissions = async () => {
+  const data = await bitable.bridge.getData<DeferredSubmission[]>(getOperatorStorageKey(DEFERRED_KEY));
+  if (!Array.isArray(data)) return;
+  deferredSubmissions.value = data.filter(item => typeof item.recordId === 'string' &&
+    typeof item.jobId === 'string' && typeof item.submittedAt === 'number');
+};
+
 const storePendingJob = async () => {
   const pending: PendingJob = pendingJobId.value && pendingPrintIds.value.length
-    ? { jobId: pendingJobId.value, recordIds: [...pendingPrintIds.value], selectedIds: [...completedPrintIds.value], hadWriteAttempt: hadWriteAttempt.value }
-    : { jobId: '', recordIds: [], selectedIds: [], hadWriteAttempt: false };
+    ? { jobId: pendingJobId.value, recordIds: [...pendingPrintIds.value], selectedIds: [...completedPrintIds.value], hadWriteAttempt: hadWriteAttempt.value, source: pendingSource.value }
+    : { jobId: '', recordIds: [], selectedIds: [], hadWriteAttempt: false, source: 'preview' };
   const ok = await bitable.bridge.setData(getOperatorStorageKey(PENDING_KEY), pending);
   if (ok === false) throw new Error('打印确认任务未能保存，暂不能继续');
 };
@@ -91,6 +108,7 @@ const recoverPendingJob = async () => {
     pendingPrintIds.value = [...new Set(saved.recordIds)];
     completedPrintIds.value = Array.isArray(saved.selectedIds) ? saved.selectedIds.filter(id=>pendingPrintIds.value.includes(id)) : [];
     hadWriteAttempt.value = saved.hadWriteAttempt === true;
+    pendingSource.value = saved.source === 'manual' ? 'manual' : 'preview';
     pendingRestored.value = true;
     showFinishDialog.value = true;
     void resolvePendingLabels();
@@ -164,6 +182,47 @@ const verifyAndUnlock = async () => {
     releaseErrors.value = e instanceof Error ? e.message : String(e);
   } finally { releaseBusy.value = false; }
 };
+const lateConfirmId = ref('');
+const lateConfirmBusy = ref(false);
+const lateConfirmError = ref('');
+const lateAttested = ref(false);
+const showLateConfirmDialog = ref(false);
+const startLateConfirmation = (id: string) => {
+  if (pendingJobId.value || finishBusy.value || lateConfirmBusy.value || isLoading.value) return;
+  lateConfirmId.value = id;
+  lateConfirmError.value = '';
+  lateAttested.value = false;
+  showLateConfirmDialog.value = true;
+};
+const submitLateConfirmation = async () => {
+  const id = lateConfirmId.value;
+  if (!id || !lateAttested.value || lateConfirmBusy.value || pendingJobId.value) return;
+  if (!selectedRecordIds.value.includes(id)) return;
+  lateConfirmBusy.value = true;
+  lateConfirmError.value = '';
+  try {
+    // A legacy batch has no submission evidence: require explicit operator attestation.
+    // A new deferred batch keeps its original job ID for correct idempotency.
+    await verifyManualLateConfirmation(id);
+    const submission = deferredRecord(id);
+    pendingJobId.value = submission?.jobId ?? `manual-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    pendingPrintIds.value = [id];
+    completedPrintIds.value = [id];
+    pendingSource.value = submission ? 'preview' : 'manual';
+    hadWriteAttempt.value = false;
+    finishErrors.value = [];
+    // Persist the job before writing anything to Feishu.
+    try { await storePendingJob(); }
+    catch(e) {
+      pendingJobId.value = ''; pendingPrintIds.value = []; completedPrintIds.value = [];
+      throw e;
+    }
+    showLateConfirmDialog.value = false;
+    await confirmFinishedPrinting();
+    if (finishErrors.value.length || pendingSaveError.value) showFinishDialog.value = true;
+  } catch(e) { lateConfirmError.value = e instanceof Error ? e.message : String(e); }
+  finally { lateConfirmBusy.value = false; }
+};
 const showFinishDialog = ref(false);
 const finishBusy = ref(false);
 const finishErrors = ref<string[]>([]);
@@ -197,7 +256,7 @@ const confirmFinishedPrinting = async () => {
   const printed = [...completedPrintIds.value];
   const labels = new Map(selectedRecordLabels.value.map(x => [x.id,x.label]));
   try {
-    const result = await confirmPrintedRecords(printed, pendingJobId.value, printOperatorId.value);
+    const result = await confirmPrintedRecords(printed, pendingJobId.value, printOperatorId.value, pendingSource.value);
     const ok = new Set(result.success);
     if (ok.size) retainSelectedRecords(selectedRecordIds.value.filter(id => !ok.has(id)));
     pendingPrintIds.value = pendingPrintIds.value.filter(id => !ok.has(id));
@@ -205,6 +264,19 @@ const confirmFinishedPrinting = async () => {
     finishErrors.value = result.failed.map(item => `${labels.get(item.id) ?? item.id}: ${item.reason}`);
     try { await storePendingJob(); } catch(e) { finishErrors.value.push(`保存恢复信息失败：${String(e)}`); }
     if (!result.failed.length) {
+      // Retain evidence for cards that were submitted to print preview but left
+      // unchecked. They can be confirmed later without submitting another print.
+      const leftovers = pendingSource.value === 'preview' ? pendingPrintIds.value.filter(id => !printed.includes(id)) : [];
+      try {
+        const kept = deferredSubmissions.value.filter(item => !ok.has(item.recordId));
+        const merged = kept.filter(item => !leftovers.includes(item.recordId));
+        for (const id of leftovers) merged.push({recordId:id,jobId:pendingJobId.value,submittedAt:Date.now()});
+        await saveDeferredSubmissions(merged);
+      } catch(e) {
+        finishErrors.value.push(`尚未保存未确认的打印凭证：${e instanceof Error ? e.message : String(e)}`);
+        showFinishDialog.value = true;
+        return;
+      }
       showFinishDialog.value = false;
       pendingPrintIds.value = [];
       completedPrintIds.value = [];
@@ -323,6 +395,7 @@ const runPrint = async (onlyValid: boolean) => {
   finishErrors.value = [];
   completedPrintIds.value = []; // Restored previews are never assumed physically printed.
   hadWriteAttempt.value = false;
+  pendingSource.value = 'preview';
   try { await storePendingJob(); }
   catch(e) { pendingSaveError.value = String(e); pendingPrintIds.value = []; pendingJobId.value = ''; resetPrintMode(); return; }
   // afterprint cannot prove a physical print. Only explicit confirmation writes Feishu data.
@@ -339,6 +412,8 @@ const runPrint = async (onlyValid: boolean) => {
 onBeforeMount(async () => {
   window.addEventListener('afterprint', onPrintPreviewClosed);
   await init();
+  try { await restoreDeferredSubmissions(); }
+  catch(e) { pendingSaveError.value = `读取打印提交凭证失败：${String(e)}`; }
   await recoverPendingJob();
   try {
     const saved = await bitable.bridge.getData<{
@@ -375,6 +450,7 @@ watch(layout, async value => {
     <el-button :loading="isLoading" :disabled="printInProgress || finishBusy || !!pendingJobId || !!pendingSaveError" @click="selectRecord">添加记录</el-button>
     <el-button :disabled="isLoading || printInProgress || !!pendingJobId || !!pendingSaveError || !currentRecords.length" @click="openManagePanel">管理已选 ({{ currentRecords.length }})</el-button>
     <el-button :disabled="isLoading || printInProgress || !!pendingJobId || !!pendingSaveError || !currentRecords.length" @click="openPrintConfirmation">打印</el-button>
+    <el-button v-if="selectedRecordIds.length === 1" type="success" plain :disabled="isLoading || printInProgress || !!pendingJobId || !!pendingSaveError" @click="startLateConfirmation(selectedRecordIds[0])">补确认已打印</el-button>
     <el-button :disabled="isLoading || printInProgress" @click="handleSetting">设置</el-button>
     <el-button v-if="pendingPrintIds.length" type="warning" @click="showFinishDialog = true">确认打印结果 ({{ pendingPrintIds.length }})</el-button>
     <el-alert v-if="pendingSaveError && !showFinishDialog" :title="pendingSaveError" type="error" :closable="false" />
@@ -397,6 +473,20 @@ watch(layout, async value => {
     </div>
   </section>
 
+  <el-dialog v-model="showLateConfirmDialog" title="补确认已完成打印（无需重新打印）"
+    width="min(520px, calc(100vw - 24px))" append-to-body :close-on-click-modal="false">
+    <p><strong>{{ selectedRecordLabels.find(x => x.id === lateConfirmId)?.label ?? lateConfirmId }}</strong></p>
+    <el-alert v-if="deferredRecord(lateConfirmId)" title="有此前打印提交记录：将复用原始打印任务编号核对，且不会再次打开打印窗口" type="info" :closable="false" />
+    <el-alert v-else title="旧批次没有可验证的提交凭证；仅限您确认实体工艺卡确实已打印成功时使用。此操作将作为人工补确认留痕。" type="warning" :closable="false" />
+    <p class="manage-hint" style="margin-top:12px">系统将核对该周转单位无既有打印日志、状态为未打印、打印次数为零，再创建首次打印日志并更新 Feishu；可能触发下游排工。</p>
+    <el-checkbox v-model="lateAttested">我已实际核实该工艺卡打印成功，并确认无需再次打印</el-checkbox>
+    <el-alert v-if="lateConfirmError" type="error" :title="lateConfirmError" :closable="false" style="margin-top:12px" />
+    <template #footer>
+      <el-button :disabled="lateConfirmBusy" @click="showLateConfirmDialog = false">取消</el-button>
+      <el-button type="primary" :loading="lateConfirmBusy" :disabled="!lateAttested" @click="submitLateConfirmation">确认完成并同步飞书</el-button>
+    </template>
+  </el-dialog>
+
   <!-- The user must explicitly confirm which cards were physically printed successfully. -->
   <el-dialog v-model="showFinishDialog" title="确认实际打印结果" width="min(520px, calc(100vw - 24px))" append-to-body :close-on-click-modal="false" :close-on-press-escape="false" :show-close="false">
     <p>本次提交 {{ pendingPrintIds.length }} 张。请勾选实际打印成功的记录；未勾选的继续保留在当前批次。</p>
@@ -407,7 +497,7 @@ watch(layout, async value => {
         </el-checkbox>
       </el-checkbox-group>
     </div>
-    <p class="manage-hint">当前飞书操作员 ID：{{ operatorIdentity }}（自动记录到日志备注）</p>
+    <p class="manage-hint">当前飞书操作员 ID：{{ operatorIdentity }}（自动写入打印人字段）</p>
     <el-alert v-if="pendingRestored" type="warning" title="已恢复上次未完成的打印确认，请仅勾选实际成功打印的卡" :closable="false" />
     <el-alert v-if="pendingSaveError" type="error" :title="pendingSaveError" :closable="false" />
     <el-alert v-if="hadWriteAttempt" type="info" title="曾尝试同步飞书。系统会核对同一任务的历史及状态；已完整同步可安全解除，部分写入则保留原任务继续恢复。" :closable="false" />
@@ -491,7 +581,10 @@ watch(layout, async value => {
     <div class="managed-record-list">
       <div v-for="(record, index) in selectedRecordLabels" :key="record.id" class="managed-row">
         <span>{{ index + 1 }}. {{ record.label }}</span>
-        <el-button size="small" type="danger" plain @click="removeFromBatch(record.id)">移除</el-button>
+        <div class="record-actions">
+          <el-button size="small" type="success" plain :disabled="!!pendingJobId || finishBusy" @click="startLateConfirmation(record.id)">补确认</el-button>
+          <el-button size="small" type="danger" plain @click="removeFromBatch(record.id)">移除</el-button>
+        </div>
       </div>
     </div>
     <template #footer><div class="manage-actions">
@@ -583,6 +676,8 @@ watch(layout, async value => {
 .history-record small { color: #888; }
 .managed-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px; border-bottom: 1px solid #e5e7eb; }
 .managed-row span { min-width: 0; overflow-wrap: anywhere; }
+.record-actions { display:flex; align-items:center; gap:5px; flex-shrink:0; }
+.record-actions :deep(.el-button + .el-button) { margin-left:0; }
 .error-list { color: #c45656; max-height: 140px; overflow-y: auto; }
 .card-count { font-size: 12px; color: #606266; }
 .manage-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 8px 0; font-size: 12px; }

@@ -150,11 +150,30 @@ export async function verifyPendingCanBeReleased(ids: string[], jobId: string): 
   if (blocked) throw new Error(`${blocked.id}: ${blocked.details}`);
 }
 
+// Manual late confirmation is permitted only for a unit with no prior print event.
+// Operators must attest that a physical card already exists. This must never
+// silently become a reprint or bypass a previous, partially written event.
+export async function verifyManualLateConfirmation(id: string): Promise<void> {
+  const s = await schema();
+  const logs = await readLogs(s);
+  if (logs.some(row => row.unitId === id)) {
+    throw new Error('该周转单位已有打印日志，不能作为首次打印进行人工补确认；请使用打印历史中的重新打印');
+  }
+  const [status, count, timestamp] = await Promise.all([
+    s.unit.getCellString(s.unitFields.status, id),
+    s.unit.getCellValue(s.unitFields.count, id),
+    s.unit.getCellValue(s.unitFields.time, id)
+  ]);
+  if (status.trim() !== '未打印' || n(count) !== 0 || n(timestamp) !== 0) {
+    throw new Error('打印状态、次数或时间已发生变化；为了防止重复确认，已停止人工补确认');
+  }
+}
+
 // Log FIRST, metadata SECOND, status LAST. Never infer printing from a closed dialog.
 // Each retry uses a stable job ID and looks for its existing log row.
 // Feishu multi-table writes are NOT atomic. Concurrent devices still require
 // a server-side unique idempotency key for strict exactly-once guarantees.
-export async function confirmPrintedRecords(ids:string[], jobId:string, operator:string):Promise<PrintWriteResult> {
+export async function confirmPrintedRecords(ids:string[], jobId:string, operator:string, source: 'preview' | 'manual' = 'preview'):Promise<PrintWriteResult> {
   if(!jobId.trim())throw new Error('打印确认批次编号缺失');
   const s=await schema();
   if(!/^ou_[A-Za-z0-9]+$/.test(operator)) throw new Error('无法识别打印人 Open ID，请检查飞书登录用户身份');
@@ -186,7 +205,7 @@ export async function confirmPrintedRecords(ids:string[], jobId:string, operator
         const previous=n(oldCount);
         target=previous+1;
         const kind=oldStatus?.text==='已打印'||previous>0?'重新打印':'首次打印';
-        const remark=key; // No operator or count data in business remarks.
+        const remark=source === 'manual' ? `${key} | 人工补确认：操作员已核实实体工艺卡` : key; // Keep count and operator in dedicated fields.
         const cells=await Promise.all([
           // The SDK's createCell typing expects a full IOpenLink even though
           // its documented convenience input accepts only recordIds.
