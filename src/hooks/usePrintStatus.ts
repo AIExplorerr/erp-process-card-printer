@@ -1,5 +1,5 @@
 import { bitable, FieldType } from '@lark-base-open/js-sdk';
-import type { IDateTimeField, INumberField, ISingleLinkField, ISingleSelectField, ITextField } from '@lark-base-open/js-sdk';
+import type { IDateTimeField, INumberField, ISingleLinkField, ISingleSelectField, ITextField, IUserField } from '@lark-base-open/js-sdk';
 
 // Field/table names and types verified against 金属表面处理生产管理系统 (6).base.
 const UNIT_TABLE = '周转单位表';
@@ -13,11 +13,14 @@ const LOG_TIME = '打印时间';
 const LOG_TYPE = '打印类型';
 const LOG_STATUS = '打印状态';
 const LOG_NOTE = '备注';
+const LOG_OPERATOR = '打印人';
+// Editable, immutable per-event checkpoint. The linked '打印次数' is only a live display.
+const LOG_TARGET_COUNT = '同步目标次数';
 const MARKER = 'ERP-PRINT-JOB:';
 
 export type PrintHistoryRecord = {
   id: string; unitId: string; label: string; time: number;
-  kind: string; status: string; note: string;
+  kind: string; status: string; note: string; targetCount: number;
 };
 export type PrintWriteResult = { success: string[]; failed: Array<{ id: string; reason: string }> };
 
@@ -46,7 +49,9 @@ async function schema():Promise<Snapshot> {
     time:assertField(l,LOG_TIME,FieldType.DateTime),
     kind:assertField(l,LOG_TYPE,FieldType.SingleSelect),
     status:assertField(l,LOG_STATUS,FieldType.SingleSelect),
-    note:assertField(l,LOG_NOTE,FieldType.Text)
+    note:assertField(l,LOG_NOTE,FieldType.Text),
+    operator:assertField(l,LOG_OPERATOR,FieldType.User),
+    target:assertField(l,LOG_TARGET_COUNT,FieldType.Number)
   }};
 }
 function n(value: unknown):number { const num=Number(value);return Number.isFinite(num)?num:0; }
@@ -64,14 +69,15 @@ async function readLogs(s:Snapshot):Promise<PrintHistoryRecord[]> {
   for (let offset=0;offset<ids.length;offset+=8) {
     const group=await Promise.all(ids.slice(offset,offset+8).map(async id=> {
       try {
-        const [link,time,kind,status,note]=await Promise.all([
+        const [link,time,kind,status,note,targetCount]=await Promise.all([
           linkField.getValue(id),
           s.log.getCellValue(s.logFields.time,id),
           s.log.getCellString(s.logFields.kind,id),
           s.log.getCellString(s.logFields.status,id),
-          s.log.getCellString(s.logFields.note,id)
+          s.log.getCellString(s.logFields.note,id),
+          s.log.getCellValue(s.logFields.target,id)
         ]);
-        return {id,unitId:link?.recordIds?.[0]||'',label:'',time:n(time),kind:kind.trim(),status:status.trim(),note:note.trim()};
+        return {id,unitId:link?.recordIds?.[0]||'',label:'',time:n(time),kind:kind.trim(),status:status.trim(),note:note.trim(),targetCount:n(targetCount)};
       } catch(e) {throw new Error(`打印日志读取失败（${id}）：${e instanceof Error?e.message:String(e)}。已停止写入，避免重复记录`);}
     }));
     for (const r of group) if(r)rows.push(r);
@@ -96,7 +102,8 @@ export async function getPrintHistory():Promise<PrintHistoryRecord[]> {
 export async function confirmPrintedRecords(ids:string[], jobId:string, operator:string):Promise<PrintWriteResult> {
   if(!jobId.trim())throw new Error('打印确认批次编号缺失');
   const s=await schema();
-  const [statusField,timeField,countField,linkField,logTime,logType,logStatus,logNote]=await Promise.all([
+  if(!/^ou_[A-Za-z0-9]+$/.test(operator)) throw new Error('无法识别打印人 Open ID，请检查飞书登录用户身份');
+  const [statusField,timeField,countField,linkField,logTime,logType,logStatus,logNote,logOperator,logTarget]=await Promise.all([
     s.unit.getField<ISingleSelectField>(s.unitFields.status),
     s.unit.getField<IDateTimeField>(s.unitFields.time),
     s.unit.getField<INumberField>(s.unitFields.count),
@@ -104,7 +111,9 @@ export async function confirmPrintedRecords(ids:string[], jobId:string, operator
     s.log.getField<IDateTimeField>(s.logFields.time),
     s.log.getField<ISingleSelectField>(s.logFields.kind),
     s.log.getField<ISingleSelectField>(s.logFields.status),
-    s.log.getField<ITextField>(s.logFields.note)
+    s.log.getField<ITextField>(s.logFields.note),
+    s.log.getField<IUserField>(s.logFields.operator),
+    s.log.getField<INumberField>(s.logFields.target)
   ]);
   const opts=await Promise.all([statusField.getOptions(),logType.getOptions(),logStatus.getOptions()]);
   if(!opts[0].some(x=>x.name==='已打印')||!opts[1].some(x=>x.name==='首次打印')||!opts[1].some(x=>x.name==='重新打印')||!opts[2].some(x=>x.name==='已打印'))throw new Error('打印状态/类型选项不匹配');
@@ -113,15 +122,16 @@ export async function confirmPrintedRecords(ids:string[], jobId:string, operator
   for(const id of [...new Set(ids)]) {
     const key=marker(jobId,id);
     try {
-      let log=existing.find(x=>x.note.includes(`${key} |`));
-      let target=targetFromNote(log?.note||'');
+      let log=existing.find(x => x.note === key || x.note.startsWith(`${key} |`));
+      // Prefer the immutable technical number. Old log rows still support legacy remarks.
+      let target=log?.targetCount || targetFromNote(log?.note||'');
       let stamp=log?.time||Date.now();
       if(!log) {
         const [oldStatus,oldCount]=await Promise.all([statusField.getValue(id),countField.getValue(id)]);
         const previous=n(oldCount);
         target=previous+1;
         const kind=oldStatus?.text==='已打印'||previous>0?'重新打印':'首次打印';
-        const remark=`${key} | 目标次数=${target} | 操作员=${operator.trim()||'未填写'}`;
+        const remark=key; // No operator or count data in business remarks.
         const cells=await Promise.all([
           // The SDK's createCell typing expects a full IOpenLink even though
           // its documented convenience input accepts only recordIds.
@@ -130,14 +140,35 @@ export async function confirmPrintedRecords(ids:string[], jobId:string, operator
           logTime.createCell(stamp),
           logType.createCell(kind),
           logStatus.createCell('已打印'),
-          logNote.createCell(remark)
+          logNote.createCell(remark),
+          logOperator.createCell({id:operator}),
+          logTarget.createCell(target)
         ]);
         const newId=await s.log.addRecord(cells);
         if(!newId)throw new Error('无法新增工艺卡打印记录');
-        log={id:newId,unitId:id,label:'',time:stamp,kind,status:'已打印',note:remark};
+        log={id:newId,unitId:id,label:'',time:stamp,kind,status:'已打印',note:remark,targetCount:target};
         existing.push(log);
       }
-      if(!target)throw new Error('历史日志目标次数缺失，需人工检查后重试');
+      if(!target)throw new Error('打印日志缺少同步目标次数；已停止写入，请人工核对后再试');
+      // A retry must use the same immutable target, never the live linked lookup.
+      const confirmedTarget=n(await logTarget.getValue(log.id));
+      if(confirmedTarget !== target) {
+        if (confirmedTarget === 0 && targetFromNote(log.note) === target) {
+          // Migrate legacy in-flight retries without discarding the original job ID.
+          checked(await logTarget.setValue(log.id,target),'同步目标次数');
+        } else {
+          throw new Error('同步目标次数不一致；停止写入，避免重复计数');
+        }
+      }
+      // Even if the history entry was created on an earlier attempt, complete
+      // and verify its operator field before changing downstream status.
+      const currentOperator = await logOperator.getValue(log.id);
+      if(!Array.isArray(currentOperator) || !currentOperator.some(u=>u.id===operator)) {
+        checked(await logOperator.setValue(log.id, {id:operator} as Parameters<typeof logOperator.setValue>[1]), '打印人');
+      }
+      const verifiedOperator = await logOperator.getValue(log.id);
+      if(!Array.isArray(verifiedOperator) || !verifiedOperator.some(u=>u.id===operator))
+        throw new Error('打印人无法解析为飞书人员，已保留历史日志供重试；打印状态未继续更新');
       const latest=n(await countField.getValue(id));
       if(latest<target) checked(await countField.setValue(id,target),'打印次数');
       checked(await timeField.setValue(id,stamp),'打印时间');

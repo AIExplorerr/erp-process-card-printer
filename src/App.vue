@@ -76,15 +76,15 @@ const hadWriteAttempt = ref(false);
 const pendingSaveError = ref('');
 type PendingJob = { jobId: string; recordIds: string[]; selectedIds: string[]; hadWriteAttempt: boolean };
 const storePendingJob = async () => {
-  const pending: PendingJob | null = pendingJobId.value && pendingPrintIds.value.length
+  const pending: PendingJob = pendingJobId.value && pendingPrintIds.value.length
     ? { jobId: pendingJobId.value, recordIds: [...pendingPrintIds.value], selectedIds: [...completedPrintIds.value], hadWriteAttempt: hadWriteAttempt.value }
-    : null;
+    : { jobId: '', recordIds: [], selectedIds: [], hadWriteAttempt: false };
   const ok = await bitable.bridge.setData(getOperatorStorageKey(PENDING_KEY), pending);
   if (ok === false) throw new Error('打印确认任务未能保存，暂不能继续');
 };
 const recoverPendingJob = async () => {
   try {
-    const saved = await bitable.bridge.getData<PendingJob | null>(getOperatorStorageKey(PENDING_KEY));
+    const saved = await bitable.bridge.getData<PendingJob>(getOperatorStorageKey(PENDING_KEY));
     if (!saved || !saved.jobId || !Array.isArray(saved.recordIds) || !saved.recordIds.length) return;
     // Show a manual confirmation rather than assuming a recovered preview was actually printed.
     pendingJobId.value = saved.jobId;
@@ -105,7 +105,7 @@ const onPrintPreviewClosed = () => {
 const keepUnfinishedBatch = async () => {
   if (finishBusy.value || hadWriteAttempt.value) return;
   try {
-    const ok = await bitable.bridge.setData(getOperatorStorageKey(PENDING_KEY), null);
+    const ok = await bitable.bridge.setData(getOperatorStorageKey(PENDING_KEY), { jobId: '', recordIds: [], selectedIds: [], hadWriteAttempt: false } satisfies PendingJob);
     if (ok === false) throw new Error('无法清除未完成确认任务');
   }
   catch(e){ pendingSaveError.value = String(e); return; }
@@ -127,7 +127,7 @@ const confirmFinishedPrinting = async () => {
   const printed = [...completedPrintIds.value];
   const labels = new Map(selectedRecordLabels.value.map(x => [x.id,x.label]));
   try {
-    const result = await confirmPrintedRecords(printed, pendingJobId.value, `Base用户ID:${printOperatorId.value}`);
+    const result = await confirmPrintedRecords(printed, pendingJobId.value, printOperatorId.value);
     const ok = new Set(result.success);
     if (ok.size) retainSelectedRecords(selectedRecordIds.value.filter(id => !ok.has(id)));
     pendingPrintIds.value = pendingPrintIds.value.filter(id => !ok.has(id));
