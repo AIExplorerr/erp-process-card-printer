@@ -149,8 +149,6 @@ const confirmFinishedPrinting = async () => {
   finally { finishBusy.value = false; }
 };
 const managedRecordIds = ref<string[]>([]);
-const selectAllManaged = () => { managedRecordIds.value = selectedRecordIds.value.slice(); };
-const deselectAllManaged = () => { managedRecordIds.value = []; };
 const batchGroups = computed(() => {
   const groups = new Map<string, number>();
   for (const record of selectedRecordLabels.value) {
@@ -169,10 +167,6 @@ const printValidOnly = ref(false);
 const openManagePanel = () => {
   managedRecordIds.value = [...selectedRecordIds.value];
   isManagePanelShow.value = true;
-};
-const applyManagedSelection = () => {
-  retainSelectedRecords(managedRecordIds.value);
-  isManagePanelShow.value = false;
 };
 const confirmClearSelection = () => {
   if (pendingJobId.value || finishBusy.value) return;

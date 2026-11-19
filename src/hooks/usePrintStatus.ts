@@ -123,7 +123,10 @@ export async function confirmPrintedRecords(ids:string[], jobId:string, operator
         const kind=oldStatus?.text==='已打印'||previous>0?'重新打印':'首次打印';
         const remark=`${key} | 目标次数=${target} | 操作员=${operator.trim()||'未填写'}`;
         const cells=await Promise.all([
-          linkField.createCell({recordIds:[id]}),
+          // The SDK's createCell typing expects a full IOpenLink even though
+          // its documented convenience input accepts only recordIds.
+          // Keep the documented runtime format and adapt the compile-time type.
+          linkField.createCell({recordIds:[id]} as Parameters<typeof linkField.createCell>[0]),
           logTime.createCell(stamp),
           logType.createCell(kind),
           logStatus.createCell('已打印'),
