@@ -2,9 +2,13 @@
 import { bitable, FieldType, ToastType } from '@lark-base-open/js-sdk';
 import { computed, nextTick, onBeforeMount, onBeforeUnmount, ref, watch } from 'vue';
 import usePrint from './hooks/usePrint';
+import { confirmPrintedRecords, getPrintHistory } from './hooks/usePrintStatus';
+import type { PrintHistoryRecord } from './hooks/usePrintStatus';
+import { getOperatorStorageKey, printOperatorId } from './hooks/usePrint';
 
 const {
   selectRecord,
+  addRecordIds,
   retainSelectedRecords,
   clearSelection,
   init,
@@ -20,7 +24,130 @@ const {
   settingList
 } = usePrint();
 
+// Active selection and Feishu-backed print history are separate views.
+const activeTab = ref<'current' | 'history'>('current');
+const historyRecords = ref<PrintHistoryRecord[]>([]);
+const historyLoading = ref(false);
+const historyError = ref('');
+const historyGroups = computed(() => {
+  const groups = new Map<string, PrintHistoryRecord[]>();
+  for (const record of historyRecords.value) {
+    const key = new Date(record.time).toLocaleDateString('zh-CN');
+    const current = groups.get(key) ?? [];
+    current.push(record);
+    groups.set(key, current);
+  }
+  return [...groups.entries()].map(([date, records]) => ({ date, records }));
+});
+const refreshHistory = async () => {
+  if (historyLoading.value) return;
+  historyLoading.value = true;
+  historyError.value = '';
+  try { historyRecords.value = await getPrintHistory(); }
+  catch (e) { historyError.value = e instanceof Error ? e.message : String(e); }
+  finally { historyLoading.value = false; }
+};
+const setActiveTab = (name: 'current' | 'history') => {
+  activeTab.value = name;
+  if (name === 'history') void refreshHistory();
+};
+const restoreFromHistory = async (ids: string[]) => {
+  if (isLoading.value || pendingJobId.value || finishBusy.value) return;
+  await addRecordIds(ids);
+  activeTab.value = 'current';
+};
+const prettyTime = (stamp: number) => stamp ? new Date(stamp).toLocaleString('zh-CN', { hour12: false }) : '时间未记录';
+
 const isManagePanelShow = ref(false);
+const isClearConfirmShow = ref(false);
+// Remove is immediate, unlike the old keep-checkbox design.
+const removeFromBatch = (id: string) => {
+  if (pendingJobId.value || finishBusy.value) return;
+  retainSelectedRecords(selectedRecordIds.value.filter(item => item !== id));
+  managedRecordIds.value = managedRecordIds.value.filter(item => item !== id);
+};
+const pendingPrintIds = ref<string[]>([]);
+const completedPrintIds = ref<string[]>([]);
+const pendingJobId = ref('');
+const PENDING_KEY = 'erp_pending_print_confirmation_v2';
+const operatorIdentity = computed(() => printOperatorId.value || '用户身份读取中');
+const pendingRestored = ref(false);
+const hadWriteAttempt = ref(false);
+const pendingSaveError = ref('');
+type PendingJob = { jobId: string; recordIds: string[]; selectedIds: string[]; hadWriteAttempt: boolean };
+const storePendingJob = async () => {
+  const pending: PendingJob | null = pendingJobId.value && pendingPrintIds.value.length
+    ? { jobId: pendingJobId.value, recordIds: [...pendingPrintIds.value], selectedIds: [...completedPrintIds.value], hadWriteAttempt: hadWriteAttempt.value }
+    : null;
+  const ok = await bitable.bridge.setData(getOperatorStorageKey(PENDING_KEY), pending);
+  if (ok === false) throw new Error('打印确认任务未能保存，暂不能继续');
+};
+const recoverPendingJob = async () => {
+  try {
+    const saved = await bitable.bridge.getData<PendingJob | null>(getOperatorStorageKey(PENDING_KEY));
+    if (!saved || !saved.jobId || !Array.isArray(saved.recordIds) || !saved.recordIds.length) return;
+    // Show a manual confirmation rather than assuming a recovered preview was actually printed.
+    pendingJobId.value = saved.jobId;
+    pendingPrintIds.value = [...new Set(saved.recordIds)];
+    completedPrintIds.value = Array.isArray(saved.selectedIds) ? saved.selectedIds.filter(id=>pendingPrintIds.value.includes(id)) : [];
+    hadWriteAttempt.value = saved.hadWriteAttempt === true;
+    pendingRestored.value = true;
+    showFinishDialog.value = true;
+  } catch (error) { pendingSaveError.value = error instanceof Error ? error.message : String(error); }
+};
+const showFinishDialog = ref(false);
+const finishBusy = ref(false);
+const finishErrors = ref<string[]>([]);
+const onPrintPreviewClosed = () => {
+  resetPrintMode();
+  if (pendingPrintIds.value.length) { completedPrintIds.value = []; showFinishDialog.value = true; }
+};
+const keepUnfinishedBatch = async () => {
+  if (finishBusy.value || hadWriteAttempt.value) return;
+  try {
+    const ok = await bitable.bridge.setData(getOperatorStorageKey(PENDING_KEY), null);
+    if (ok === false) throw new Error('无法清除未完成确认任务');
+  }
+  catch(e){ pendingSaveError.value = String(e); return; }
+  showFinishDialog.value = false;
+  pendingPrintIds.value = [];
+  completedPrintIds.value = [];
+  pendingJobId.value = '';
+  finishErrors.value = [];
+  hadWriteAttempt.value = false;
+  pendingRestored.value = false;
+};
+const confirmFinishedPrinting = async () => {
+  if (finishBusy.value || !completedPrintIds.value.length || !pendingJobId.value) return;
+  finishBusy.value = true;
+  finishErrors.value = [];
+  hadWriteAttempt.value = true;
+  try { await storePendingJob(); }
+  catch(e) { finishErrors.value = [String(e)]; finishBusy.value = false; return; }
+  const printed = [...completedPrintIds.value];
+  const labels = new Map(selectedRecordLabels.value.map(x => [x.id,x.label]));
+  try {
+    const result = await confirmPrintedRecords(printed, pendingJobId.value, `Base用户ID:${printOperatorId.value}`);
+    const ok = new Set(result.success);
+    if (ok.size) retainSelectedRecords(selectedRecordIds.value.filter(id => !ok.has(id)));
+    pendingPrintIds.value = pendingPrintIds.value.filter(id => !ok.has(id));
+    completedPrintIds.value = result.failed.map(item => item.id);
+    finishErrors.value = result.failed.map(item => `${labels.get(item.id) ?? item.id}: ${item.reason}`);
+    try { await storePendingJob(); } catch(e) { finishErrors.value.push(`保存恢复信息失败：${String(e)}`); }
+    if (!result.failed.length) {
+      showFinishDialog.value = false;
+      pendingPrintIds.value = [];
+      completedPrintIds.value = [];
+      pendingJobId.value = '';
+      try { await storePendingJob(); } catch(e) { pendingSaveError.value = String(e); }
+      pendingRestored.value = false;
+      hadWriteAttempt.value = false;
+      void refreshHistory();
+      bitable.ui.showToast({ toastType: ToastType.success, message: `已同步 ${ok.size} 条记录并写入打印日志` });
+    }
+  } catch (e) { finishErrors.value = [e instanceof Error ? e.message : String(e)]; }
+  finally { finishBusy.value = false; }
+};
 const managedRecordIds = ref<string[]>([]);
 const selectAllManaged = () => { managedRecordIds.value = selectedRecordIds.value.slice(); };
 const deselectAllManaged = () => { managedRecordIds.value = []; };
@@ -48,9 +175,11 @@ const applyManagedSelection = () => {
   isManagePanelShow.value = false;
 };
 const confirmClearSelection = () => {
+  if (pendingJobId.value || finishBusy.value) return;
   clearSelection();
   managedRecordIds.value = [];
   isManagePanelShow.value = false;
+  isClearConfirmShow.value = false;
 };
 
 // Find the attachment that is actually printed on each process card.
@@ -85,7 +214,7 @@ const visiblePrintItems = computed(() => printValidOnly.value
   : printItems.value);
 
 const openPrintConfirmation = () => {
-  if (isLoading.value || printInProgress.value || !printItems.value.length) return;
+  if (isLoading.value || printInProgress.value || pendingPrintIds.value.length || pendingSaveError.value || !printItems.value.length) return;
   isPrintConfirmShow.value = true;
 };
 
@@ -124,17 +253,29 @@ const runPrint = async (onlyValid: boolean) => {
     return;
   }
 
-  // In Feishu's embedded browser, afterprint normally fires when preview closes.
+  // Record exactly the cards submitted to the print preview, not every selected card.
+  pendingPrintIds.value = visiblePrintItems.value.map(item => item.id);
+  pendingJobId.value = `job-${Date.now()}-${Math.random().toString(36).slice(2,10)}`;
+  finishErrors.value = [];
+  completedPrintIds.value = []; // Restored previews are never assumed physically printed.
+  hadWriteAttempt.value = false;
+  try { await storePendingJob(); }
+  catch(e) { pendingSaveError.value = String(e); pendingPrintIds.value = []; pendingJobId.value = ''; resetPrintMode(); return; }
+  // afterprint cannot prove a physical print. Only explicit confirmation writes Feishu data.
   try { window.print(); }
   catch (error) {
+    pendingPrintIds.value = [];
+    pendingJobId.value = '';
+    try { await storePendingJob(); } catch(e) { pendingSaveError.value = String(e); }
     resetPrintMode();
     bitable.ui.showToast({ toastType: ToastType.error, message: '无法打开打印预览，请重试' });
   }
 };
 
 onBeforeMount(async () => {
-  window.addEventListener('afterprint', resetPrintMode);
+  window.addEventListener('afterprint', onPrintPreviewClosed);
   await init();
+  await recoverPendingJob();
   try {
     const saved = await bitable.bridge.getData<{
       fontSize?: number; cellPadding?: number; labelWidth?: number; qrSize?: number;
@@ -151,7 +292,7 @@ onBeforeMount(async () => {
     console.error('Failed to load layout settings:', error);
   }
 });
-onBeforeUnmount(() => window.removeEventListener('afterprint', resetPrintMode));
+onBeforeUnmount(() => window.removeEventListener('afterprint', onPrintPreviewClosed));
 
 const LAYOUT_KEY = 'erp_process_card_layout_v1';
 const layout = ref({ fontSize: 9, cellPadding: 1.5, labelWidth: 32, qrSize: 20 });
@@ -162,22 +303,67 @@ watch(layout, async value => {
 </script>
 
 <template>
-  <div class="my-tools-container">
-    <el-button :loading="isLoading" :disabled="printInProgress" @click="selectRecord">添加记录</el-button>
-    <el-button :disabled="isLoading || printInProgress || currentRecords.length === 0" @click="openManagePanel">
-      管理已选 ({{ currentRecords.length }})
-    </el-button>
-    <el-button :disabled="isLoading || printInProgress || currentRecords.length === 0" @click="openPrintConfirmation">打印</el-button>
+  <div class="workspace-switcher">
+    <el-button :type="activeTab === 'current' ? 'primary' : 'default'" @click="setActiveTab('current')">当前批次 ({{ currentRecords.length }})</el-button>
+    <el-button :type="activeTab === 'history' ? 'primary' : 'default'" @click="setActiveTab('history')">打印历史</el-button>
+  </div>
+  <div v-if="activeTab === 'current'" class="my-tools-container">
+    <el-button :loading="isLoading" :disabled="printInProgress || finishBusy || !!pendingJobId || !!pendingSaveError" @click="selectRecord">添加记录</el-button>
+    <el-button :disabled="isLoading || printInProgress || !!pendingJobId || !!pendingSaveError || !currentRecords.length" @click="openManagePanel">管理已选 ({{ currentRecords.length }})</el-button>
+    <el-button :disabled="isLoading || printInProgress || !!pendingJobId || !!pendingSaveError || !currentRecords.length" @click="openPrintConfirmation">打印</el-button>
     <el-button :disabled="isLoading || printInProgress" @click="handleSetting">设置</el-button>
+    <el-button v-if="pendingPrintIds.length" type="warning" @click="showFinishDialog = true">确认打印结果 ({{ pendingPrintIds.length }})</el-button>
+    <el-alert v-if="pendingSaveError && !showFinishDialog" :title="pendingSaveError" type="error" :closable="false" />
     <span v-if="currentRecords.length" class="card-count">已选 {{ currentRecords.length }} 张 · {{ batchGroups.length }} 组 · 预计 {{ currentRecords.length }} 页</span>
     <span v-if="isLoading" class="card-count">读取中 {{ loadProgress.done }}/{{ loadProgress.total }}</span>
     <span v-else-if="restoreNotice" class="card-count">{{ restoreNotice }}</span>
   </div>
+  <section v-else class="history-panel">
+    <div class="history-toolbar"><strong>已确认打印记录</strong><el-button :loading="historyLoading" @click="refreshHistory">刷新</el-button></div>
+    <el-alert v-if="historyError" :title="historyError" type="error" :closable="false" />
+    <p class="history-note">从飞书「工艺卡打印记录表」读取每次已确认的打印记录，包括首次打印与重新打印。</p>
+    <p v-if="!historyLoading && !historyGroups.length">暂无已确认打印的记录。</p>
+    <div v-for="group in historyGroups" :key="group.date" class="history-group">
+      <div class="history-group-heading"><strong>{{ group.date }}</strong> · {{ group.records.length }} 张</div>
+      <div v-for="item in group.records" :key="item.id" class="history-record">
+        <span>{{ item.label }} <small>{{ item.kind }} · {{ prettyTime(item.time) }}</small></span>
+        <el-button size="small" :disabled="!item.unitId" @click="restoreFromHistory([item.unitId])">重新加入</el-button>
+      </div>
+      <el-button size="small" plain @click="restoreFromHistory(group.records.map(item => item.unitId).filter(Boolean))">本日记录重新加入批次</el-button>
+    </div>
+  </section>
+
+  <!-- The user must explicitly confirm which cards were physically printed successfully. -->
+  <el-dialog v-model="showFinishDialog" title="确认实际打印结果" width="min(520px, calc(100vw - 24px))" append-to-body :close-on-click-modal="false" :close-on-press-escape="false" :show-close="false">
+    <p>本次提交 {{ pendingPrintIds.length }} 张。请勾选实际打印成功的记录；未勾选的继续保留在当前批次。</p>
+    <div class="finish-checklist">
+      <el-checkbox-group v-model="completedPrintIds">
+        <el-checkbox v-for="id in pendingPrintIds" :key="id" :value="id" style="display:block;margin:5px 0">
+          {{ selectedRecordLabels.find(x=>x.id===id)?.label ?? id }}
+        </el-checkbox>
+      </el-checkbox-group>
+    </div>
+    <p class="manage-hint">当前飞书操作员 ID：{{ operatorIdentity }}（自动记录到日志备注）</p>
+    <el-alert v-if="pendingRestored" type="warning" title="已恢复上次未完成的打印确认，请仅勾选实际成功打印的卡" :closable="false" />
+    <el-alert v-if="pendingSaveError" type="error" :title="pendingSaveError" :closable="false" />
+    <el-alert v-if="hadWriteAttempt" type="info" title="已尝试写入飞书；为避免重复记录，无法直接丢弃本次任务。请重试同步或联系管理员核对日志。" :closable="false" />
+    <el-alert v-if="finishErrors.length" title="部分记录同步失败；同一批次可安全重试" :closable="false" type="error" style="margin-top:10px">
+      <div v-for="error in finishErrors" :key="error">{{ error }}</div>
+    </el-alert>
+    <template #footer>
+      <el-button :disabled="finishBusy || hadWriteAttempt" @click="keepUnfinishedBatch">未完成，全部保留</el-button>
+      <el-button type="primary" :disabled="!completedPrintIds.length" :loading="finishBusy" @click="confirmFinishedPrinting">确认 {{ completedPrintIds.length }} 张并同步飞书</el-button>
+    </template>
+  </el-dialog>
+  <el-dialog v-model="isClearConfirmShow" title="清空当前批次？" width="min(440px, calc(100vw - 24px))" append-to-body>
+    <p>这将移除当前批次的全部记录，不会删除飞书表格中的任何记录，也不会清除打印历史。</p>
+    <template #footer><el-button @click="isClearConfirmShow = false">取消</el-button><el-button type="danger" @click="confirmClearSelection">确认清空当前批次</el-button></template>
+  </el-dialog>
 
   <el-dialog
     v-model="isPrintConfirmShow"
     title="打印前确认"
-    width="520px"
+    width="min(520px, calc(100vw - 24px))"
     top="5vh"
     append-to-body
     class="print-confirm-dialog"
@@ -226,51 +412,32 @@ watch(layout, async value => {
   <el-dialog
     v-model="isManagePanelShow"
     title="管理已选记录"
-    width="600px"
+    width="min(600px, calc(100vw - 24px))"
     top="5vh"
     append-to-body
     class="manage-records-dialog"
   >
     <p class="manage-hint">已按周转单位编号自动排序（工单编号 → #后数字）。此列表顺序即最终打印顺序。</p>
-    <p class="manage-hint">取消勾选不需要打印的记录，然后点击「应用选择」。</p>
-    <div class="manage-summary">当前批次 {{ selectedRecordIds.length }} 条，保留 {{ managedRecordIds.length }} 条</div>
-    <div class="manage-toolbar">
-      <el-button size="small" @click="selectAllManaged">全选</el-button>
-      <el-button size="small" @click="deselectAllManaged">全不选</el-button>
-      <span>共 {{ batchGroups.length }} 个编号组</span>
-    </div>
-    <div class="batch-group-summary">
-      <span v-for="group in batchGroups" :key="group.name">{{ group.name }}：{{ group.count }} 张</span>
-    </div>
-    <el-checkbox-group v-model="managedRecordIds" class="managed-record-list">
-      <el-checkbox
-        v-for="(record, index) in selectedRecordLabels"
-        :key="record.id"
-        :value="record.id"
-        class="managed-record-item"
-      >{{ index + 1 }}. {{ record.label }}</el-checkbox>
-    </el-checkbox-group>
-    <template #footer>
-      <div class="manage-actions">
-        <el-popconfirm
-          title="确认清空当前批次的全部记录？"
-          confirm-button-text="确认清空"
-          cancel-button-text="取消"
-          @confirm="confirmClearSelection"
-        >
-          <template #reference><el-button type="danger" plain>清空选择</el-button></template>
-        </el-popconfirm>
-        <span class="manage-action-spacer"></span>
-        <el-button @click="isManagePanelShow = false">取消</el-button>
-        <el-button type="primary" @click="applyManagedSelection">应用选择</el-button>
+    <p class="manage-hint">点击「移除」即可从当前批次移除单条记录，不会删除飞书原始记录。</p>
+    <div class="manage-summary">当前批次 {{ selectedRecordIds.length }} 条 · {{ batchGroups.length }} 组</div>
+    <div class="batch-group-summary"><span v-for="group in batchGroups" :key="group.name">{{ group.name }}：{{ group.count }} 张</span></div>
+    <div class="managed-record-list">
+      <div v-for="(record, index) in selectedRecordLabels" :key="record.id" class="managed-row">
+        <span>{{ index + 1 }}. {{ record.label }}</span>
+        <el-button size="small" type="danger" plain @click="removeFromBatch(record.id)">移除</el-button>
       </div>
-    </template>
+    </div>
+    <template #footer><div class="manage-actions">
+      <el-button type="danger" plain @click="isClearConfirmShow = true">清空当前批次</el-button>
+      <span class="manage-action-spacer"></span>
+      <el-button type="primary" @click="isManagePanelShow = false">完成</el-button>
+    </div></template>
   </el-dialog>
 
   <el-dialog
     v-model="isSettingPanelShow"
     title="工艺卡打印设置"
-    width="600px"
+    width="min(600px, calc(100vw - 24px))"
     top="5vh"
     class="print-settings-dialog"
     append-to-body
@@ -304,7 +471,7 @@ watch(layout, async value => {
     </el-tabs>
   </el-dialog>
 
-  <div v-if="currentRecords.length" id="my-print-container">
+  <div v-if="currentRecords.length" v-show="activeTab === 'current'" id="my-print-container">
     <div
       v-for="item in visiblePrintItems"
       :key="item.id"
@@ -338,6 +505,18 @@ watch(layout, async value => {
 </template>
 
 <style scoped>
+.workspace-switcher { display: flex; gap: 8px; flex-wrap: wrap; padding: 8px 4px; }
+.workspace-switcher :deep(.el-button + .el-button) { margin-left: 0; }
+.history-panel { padding: 10px; font-size: 13px; }
+.history-toolbar { display: flex; justify-content: space-between; align-items: center; }
+.history-note { color: #606266; line-height: 1.5; }
+.history-group { border: 1px solid #ddd; padding: 10px; margin: 10px 0; }
+.history-group-heading { margin-bottom: 8px; }
+.history-record { display: flex; gap: 6px; justify-content: space-between; align-items: center; padding: 5px 0; border-bottom: 1px solid #eee; }
+.history-record small { color: #888; }
+.managed-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 6px; border-bottom: 1px solid #e5e7eb; }
+.managed-row span { min-width: 0; overflow-wrap: anywhere; }
+.error-list { color: #c45656; max-height: 140px; overflow-y: auto; }
 .card-count { font-size: 12px; color: #606266; }
 .manage-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 8px 0; font-size: 12px; }
 .batch-group-summary { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-bottom: 12px; font-size: 12px; color: #606266; }
@@ -376,7 +555,7 @@ watch(layout, async value => {
 .layout-description p { margin: 4px 0; }
 
 @media print {
-  .my-tools-container { display: none !important; }
+  .my-tools-container, .workspace-switcher, .history-panel { display: none !important; }
   .print-sheet {
     width: 92mm; max-width: 92mm; margin: 0 auto;
     break-inside: avoid; page-break-inside: avoid;
@@ -402,7 +581,7 @@ watch(layout, async value => {
 @page { size: 100mm 150mm; margin: 4mm; }
 @media print {
   html, body, #app { margin: 0 !important; padding: 0 !important; }
-  .my-tools-container, .el-overlay { display: none !important; }
+  .my-tools-container, .workspace-switcher, .history-panel, .el-overlay { display: none !important; }
   /* Hide the injected Netlify badge in PDF output. */
   body > :not(#app) { display: none !important; }
 }

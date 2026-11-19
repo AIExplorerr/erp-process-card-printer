@@ -4,7 +4,13 @@ import { ref } from 'vue';
 import type { IFieldMetaSettings, IFieldMetaWithValue } from '../types';
 
 const SETTING_KEY = 'my_print_setting';
-const BATCH_KEY = 'erp_saved_print_batch_v1';
+const BATCH_KEY = 'erp_saved_print_batch_v2';
+let userStorageKey = '';
+export const printOperatorId = ref('');
+export const getOperatorStorageKey = (kind: string) => {
+  if (!userStorageKey) throw new Error('无法确认当前操作员，已停止保存操作以防止混用批次');
+  return `${kind}_${userStorageKey}`;
+};
 
 type SelectedRecordLabel = { id: string; label: string };
 
@@ -45,10 +51,15 @@ const usePrint = () => {
   const init = async () => {
     const table = await bitable.base.getActiveTable();
     activeTableId.value = table.id;
+    // The bridge store is Base-level. Namespace by the authenticated Base user and table.
+    const operatorId = await bitable.bridge.getBaseUserId();
+    if (!operatorId || typeof operatorId !== 'string') throw new Error('无法获取飞书用户身份，请重新打开插件');
+    printOperatorId.value = operatorId;
+    userStorageKey = `${table.id}_${operatorId}`;
     fieldList.value = await table.getFieldMetaList();
     await getSettingList();
     try {
-      const saved = await bitable.bridge.getData<{tableId: string; recordIds: string[]}>(BATCH_KEY);
+      const saved = await bitable.bridge.getData<{tableId: string; recordIds: string[]}>(getOperatorStorageKey(BATCH_KEY));
       if (saved?.tableId === table.id && Array.isArray(saved.recordIds) && saved.recordIds.length) {
         selectedRecordIds.value = [...new Set(saved.recordIds.filter((id): id is string => typeof id === 'string' && !!id))];
         await loadSelectedRecords();
@@ -83,7 +94,7 @@ const usePrint = () => {
 
   const persistBatch = async () => {
     try {
-      await bitable.bridge.setData(BATCH_KEY, {
+      await bitable.bridge.setData(getOperatorStorageKey(BATCH_KEY), {
         tableId: activeTableId.value,
         recordIds: [...selectedRecordIds.value]
       });
@@ -169,6 +180,15 @@ const usePrint = () => {
     }
   };
 
+  // Add existing records from print history into the current batch without duplicates.
+  const addRecordIds = async (ids: string[]) => {
+    if (isLoading.value || !ids.length) return;
+    const merged = [...new Set([...selectedRecordIds.value, ...ids])];
+    if (merged.length === selectedRecordIds.value.length) return;
+    selectedRecordIds.value = merged;
+    await loadSelectedRecords();
+  };
+
   // The native Feishu picker cannot be prechecked; treat its result as ADDITIONS.
   const selectRecord = async () => {
     if (isLoading.value) return;
@@ -249,6 +269,7 @@ const usePrint = () => {
     settingList,
     init,
     selectRecord,
+    addRecordIds,
     retainSelectedRecords,
     clearSelection,
     handlePrint,
