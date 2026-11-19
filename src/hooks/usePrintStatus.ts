@@ -95,6 +95,30 @@ export async function getPrintHistory():Promise<PrintHistoryRecord[]> {
     .sort((a,b)=>b.time-a.time||b.id.localeCompare(a.id));
 }
 
+// Only release an interrupted first-print attempt when Feishu proves that
+// no matching event exists AND no printing metadata was written to any unit.
+// Reprint attempts (already printed units) require manual review because their
+// status would remain 已打印 even after a successful reprint.
+export async function verifyPendingCanBeReleased(ids: string[], jobId: string): Promise<void> {
+  if (!jobId || !ids.length) throw new Error('待核对打印任务不完整');
+  const s = await schema();
+  const events = await readLogs(s);
+  for (const id of [...new Set(ids)]) {
+    const key = marker(jobId, id);
+    if (events.some(event => event.note === key || event.note.startsWith(`${key} |`))) {
+      throw new Error(`记录 ${id} 已存在该任务的打印日志，不能解除锁定；请检查后重试同步`);
+    }
+    const [status, count, timestamp] = await Promise.all([
+      s.unit.getCellString(s.unitFields.status, id),
+      s.unit.getCellValue(s.unitFields.count, id),
+      s.unit.getCellValue(s.unitFields.time, id)
+    ]);
+    if (status.trim() !== '未打印' || n(count) !== 0 || n(timestamp) !== 0) {
+      throw new Error(`记录 ${id} 的打印状态、次数或时间已有变化；为避免遗漏写入，拒绝自动解除，请人工核对`);
+    }
+  }
+}
+
 // Log FIRST, metadata SECOND, status LAST. Never infer printing from a closed dialog.
 // Each retry uses a stable job ID and looks for its existing log row.
 // Feishu multi-table writes are NOT atomic. Concurrent devices still require

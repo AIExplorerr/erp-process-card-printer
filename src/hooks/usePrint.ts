@@ -4,6 +4,7 @@ import { ref } from 'vue';
 import type { IFieldMetaSettings, IFieldMetaWithValue } from '../types';
 
 const SETTING_KEY = 'my_print_setting';
+const SOURCE_TABLE = '周转单位表';
 const BATCH_KEY = 'erp_saved_print_batch_v2';
 let userStorageKey = '';
 export const printOperatorId = ref('');
@@ -49,7 +50,7 @@ const usePrint = () => {
   let loadGeneration = 0;
 
   const init = async () => {
-    const table = await bitable.base.getActiveTable();
+    const table = await bitable.base.getTable(SOURCE_TABLE);
     activeTableId.value = table.id;
     // The bridge store is Base-level. Namespace by the authenticated Base user and table.
     const operatorId = await bitable.bridge.getBaseUserId();
@@ -112,7 +113,7 @@ const usePrint = () => {
     isLoading.value = true;
     loadProgress.value = { done: 0, total: selectedRecordIds.value.length };
     try {
-      const table = await bitable.base.getActiveTable();
+      const table = await bitable.base.getTable(SOURCE_TABLE);
       const orderedSettings = settingList.value.filter(setting => !setting.hidden);
       const fieldMetaMap = new Map(fieldList.value.map(field => [field.id, field]));
       const identifierField = fieldList.value.find(field => field.name === '周转单位编号')
@@ -193,7 +194,7 @@ const usePrint = () => {
   const selectRecord = async () => {
     if (isLoading.value) return;
     try {
-      const table = await bitable.base.getActiveTable();
+      const table = await bitable.base.getTable(SOURCE_TABLE);
       const view = await table.getActiveView();
       const newlyChosen = await bitable.ui.selectRecordIdList(table.id, view.id);
       if (!Array.isArray(newlyChosen) || newlyChosen.length === 0) return;
