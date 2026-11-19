@@ -2,7 +2,7 @@
 import { bitable, FieldType, ToastType } from '@lark-base-open/js-sdk';
 import { computed, nextTick, onBeforeMount, onBeforeUnmount, ref, watch } from 'vue';
 import usePrint from './hooks/usePrint';
-import { confirmPrintedRecords, getPrintHistory, verifyPendingCanBeReleased } from './hooks/usePrintStatus';
+import { confirmPrintedRecords, getPrintHistory, inspectPendingPrintJob } from './hooks/usePrintStatus';
 import type { PrintHistoryRecord } from './hooks/usePrintStatus';
 import { getOperatorStorageKey, printOperatorId } from './hooks/usePrint';
 
@@ -94,6 +94,8 @@ const recoverPendingJob = async () => {
     pendingRestored.value = true;
     showFinishDialog.value = true;
     void resolvePendingLabels();
+    // Safely dismiss a stale job only if every card is fully synchronized.
+    void autoDismissCompletedJob();
   } catch (error) { pendingSaveError.value = error instanceof Error ? error.message : String(error); }
 };
 const releaseBusy = ref(false);
@@ -111,28 +113,53 @@ const resolvePendingLabels = async () => {
     }
   } catch { /* keep raw IDs */ }
 };
+const clearRecoveredJob = async (completed: string[], unsuccessful: string[]) => {
+  const cleared: PendingJob = {jobId:'', recordIds:[], selectedIds:[], hadWriteAttempt:false};
+  const written = await bitable.bridge.setData(getOperatorStorageKey(PENDING_KEY), cleared);
+  if (written === false) throw new Error('无法清理已核对的任务存储，请稍后再试');
+  pendingPrintIds.value = [];
+  completedPrintIds.value = [];
+  pendingJobId.value = '';
+  hadWriteAttempt.value = false;
+  pendingRestored.value = false;
+  pendingSaveError.value = '';
+  finishErrors.value = [];
+  releaseErrors.value = '';
+  showFinishDialog.value = false;
+  // Do not return already completed cards to an unfinished batch.
+  if (completed.length) retainSelectedRecords(selectedRecordIds.value.filter(id => !completed.includes(id)));
+  if (unsuccessful.length) await addRecordIds(unsuccessful);
+};
+const autoDismissCompletedJob = async () => {
+  if (releaseBusy.value || !pendingJobId.value || !pendingPrintIds.value.length) return;
+  releaseBusy.value = true;
+  try {
+    const checks = await inspectPendingPrintJob([...pendingPrintIds.value], pendingJobId.value);
+    if (checks.length && checks.every(x => x.state === 'completed')) {
+      await clearRecoveredJob(checks.map(x=>x.id), []);
+      bitable.ui.showToast({toastType: ToastType.success, message:'已核对上次任务全部同步完成，自动清理过期确认'});
+    } else if (checks.some(x => x.state === 'needsResume')) {
+      releaseErrors.value = checks.filter(x=>x.state==='needsResume').map(x=>x.details).join('；');
+    }
+  } catch(e) {
+    // Read errors must never clear the pending task.
+    releaseErrors.value = `自动核对未成功：${e instanceof Error?e.message:String(e)}`;
+  } finally { releaseBusy.value = false; }
+};
 const verifyAndUnlock = async () => {
   if (finishBusy.value || releaseBusy.value || !pendingJobId.value) return;
   releaseBusy.value = true;
   releaseErrors.value = '';
-  const ids = [...pendingPrintIds.value];
   try {
-    // Never clear pending tasks if the related table write may have started.
-    await verifyPendingCanBeReleased(ids, pendingJobId.value);
-    const cleared: PendingJob = {jobId:'', recordIds:[], selectedIds:[], hadWriteAttempt:false};
-    const written = await bitable.bridge.setData(getOperatorStorageKey(PENDING_KEY), cleared);
-    if (written === false) throw new Error('解除锁定失败：无法写入待打印任务存储');
-    pendingPrintIds.value = [];
-    completedPrintIds.value = [];
-    pendingJobId.value = '';
-    hadWriteAttempt.value = false;
-    pendingRestored.value = false;
-    pendingSaveError.value = '';
-    finishErrors.value = [];
-    showFinishDialog.value = false;
-    // Put the unsuccessful cards back into the active batch when possible.
-    await addRecordIds(ids);
-    bitable.ui.showToast({toastType: ToastType.success, message:'已核对飞书无打印写入，任务已解锁；可重新操作'});
+    const checks = await inspectPendingPrintJob([...pendingPrintIds.value], pendingJobId.value);
+    const blocked = checks.find(x => x.state === 'unsafe' || x.state === 'needsResume');
+    if (blocked) throw new Error(`${pendingLabel(blocked.id)}：${blocked.details}`);
+    const done = checks.filter(x => x.state === 'completed').map(x=>x.id);
+    const untouched = checks.filter(x => x.state === 'unwritten').map(x=>x.id);
+    await clearRecoveredJob(done, untouched);
+    bitable.ui.showToast({toastType: ToastType.success,
+      message:done.length ? `已核对 ${done.length} 张已完成、${untouched.length} 张未写入，安全解除锁定`
+        : '已核对未产生打印写入，安全解除锁定'});
   } catch (e) {
     releaseErrors.value = e instanceof Error ? e.message : String(e);
   } finally { releaseBusy.value = false; }
@@ -144,6 +171,7 @@ const onPrintPreviewClosed = () => {
   resetPrintMode();
   if (pendingPrintIds.value.length) { completedPrintIds.value = []; showFinishDialog.value = true; }
 };
+const dismissPendingDialog = () => { if (!finishBusy.value && !releaseBusy.value) showFinishDialog.value = false; };
 const keepUnfinishedBatch = async () => {
   if (finishBusy.value || hadWriteAttempt.value) return;
   try {
@@ -382,14 +410,15 @@ watch(layout, async value => {
     <p class="manage-hint">当前飞书操作员 ID：{{ operatorIdentity }}（自动记录到日志备注）</p>
     <el-alert v-if="pendingRestored" type="warning" title="已恢复上次未完成的打印确认，请仅勾选实际成功打印的卡" :closable="false" />
     <el-alert v-if="pendingSaveError" type="error" :title="pendingSaveError" :closable="false" />
-    <el-alert v-if="hadWriteAttempt" type="info" title="曾尝试同步飞书。可先核对状态、历史及次数；全部未写入时可解除锁定。" :closable="false" />
+    <el-alert v-if="hadWriteAttempt" type="info" title="曾尝试同步飞书。系统会核对同一任务的历史及状态；已完整同步可安全解除，部分写入则保留原任务继续恢复。" :closable="false" />
     <el-alert v-if="releaseErrors" type="error" :title="releaseErrors" :closable="false" />
     <el-alert v-if="finishErrors.length" title="部分记录同步失败；同一批次可安全重试" :closable="false" type="error" style="margin-top:10px">
       <div v-for="error in finishErrors" :key="error">{{ error }}</div>
     </el-alert>
     <template #footer>
       <el-button :disabled="finishBusy || releaseBusy || hadWriteAttempt" @click="keepUnfinishedBatch">未完成，全部保留</el-button>
-      <el-button v-if="hadWriteAttempt" :loading="releaseBusy" :disabled="finishBusy" type="warning" plain @click="verifyAndUnlock">核对并解除锁定</el-button>
+      <el-button :disabled="finishBusy || releaseBusy" @click="dismissPendingDialog">暂时关闭（保留待核对任务）</el-button>
+      <el-button v-if="hadWriteAttempt" :loading="releaseBusy" :disabled="finishBusy" type="warning" plain @click="verifyAndUnlock">核对状态并解除锁定</el-button>
       <el-button type="primary" :disabled="!completedPrintIds.length" :loading="finishBusy" @click="confirmFinishedPrinting">确认 {{ completedPrintIds.length }} 张并同步飞书</el-button>
     </template>
   </el-dialog>

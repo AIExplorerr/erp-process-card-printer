@@ -95,28 +95,59 @@ export async function getPrintHistory():Promise<PrintHistoryRecord[]> {
     .sort((a,b)=>b.time-a.time||b.id.localeCompare(a.id));
 }
 
-// Only release an interrupted first-print attempt when Feishu proves that
-// no matching event exists AND no printing metadata was written to any unit.
-// Reprint attempts (already printed units) require manual review because their
-// status would remain 已打印 even after a successful reprint.
-export async function verifyPendingCanBeReleased(ids: string[], jobId: string): Promise<void> {
+// Read-only reconciliation of the exact saved job. A matching history entry is
+// NOT itself a failure: it may represent a completed confirmation whose local
+// bridge cleanup failed. Never create or update rows during this inspection.
+export type PendingCheck = { id: string; state: 'completed' | 'unwritten' | 'needsResume' | 'unsafe'; details: string };
+export async function inspectPendingPrintJob(ids: string[], jobId: string): Promise<PendingCheck[]> {
   if (!jobId || !ids.length) throw new Error('待核对打印任务不完整');
   const s = await schema();
   const events = await readLogs(s);
+  const results: PendingCheck[] = [];
   for (const id of [...new Set(ids)]) {
     const key = marker(jobId, id);
-    if (events.some(event => event.note === key || event.note.startsWith(`${key} |`))) {
-      throw new Error(`记录 ${id} 已存在该任务的打印日志，不能解除锁定；请检查后重试同步`);
+    const matching = events.filter(x => x.note === key || x.note.startsWith(`${key} |`));
+    if (matching.length > 1) {
+      results.push({id, state:'unsafe', details:'同一任务发现多条打印日志，需要人工核对'});
+      continue;
     }
-    const [status, count, timestamp] = await Promise.all([
-      s.unit.getCellString(s.unitFields.status, id),
-      s.unit.getCellValue(s.unitFields.count, id),
-      s.unit.getCellValue(s.unitFields.time, id)
+    const [status, countRaw, timeRaw] = await Promise.all([
+      s.unit.getCellString(s.unitFields.status,id),
+      s.unit.getCellValue(s.unitFields.count,id),
+      s.unit.getCellValue(s.unitFields.time,id)
     ]);
-    if (status.trim() !== '未打印' || n(count) !== 0 || n(timestamp) !== 0) {
-      throw new Error(`记录 ${id} 的打印状态、次数或时间已有变化；为避免遗漏写入，拒绝自动解除，请人工核对`);
+    const count = n(countRaw), stamp = n(timeRaw);
+    const event = matching[0];
+    if (!event) {
+      const clean = status.trim() === '未打印' && count === 0 && stamp === 0;
+      results.push({id, state:clean ? 'unwritten' : 'unsafe',
+        details:clean ? '未找到任务日志，打印状态/次数/时间均未写入' : '无任务日志，但打印数据不为空；可能存在其他任务或历史打印'});
+      continue;
     }
+    if (event.unitId !== id) {
+      results.push({id, state:'unsafe', details:`打印日志 ${event.id} 的关联周转单位不匹配`});
+      continue;
+    }
+    const target = event.targetCount || targetFromNote(event.note);
+    if (!target || !event.time) {
+      results.push({id, state:'unsafe', details:`日志 ${event.id} 缺少同步目标次数或打印时间`});
+      continue;
+    }
+    const complete = event.status === '已打印' && status.trim() === '已打印'
+      && count >= target && Math.abs(stamp - event.time) <= 1000;
+    results.push({id, state: complete ? 'completed' : 'needsResume',
+      details: complete ? `已完成同步（日志 ${event.id}，次数 ${target}）`
+        : `日志 ${event.id} 已创建，但打印状态/次数/时间未全部匹配；请使用原任务继续同步`});
   }
+  return results;
+}
+
+// Compatibility for previous callers: only completely untouched FIRST PRINTS
+// may be dropped, otherwise preserve the saved job for recovery.
+export async function verifyPendingCanBeReleased(ids: string[], jobId: string): Promise<void> {
+  const results = await inspectPendingPrintJob(ids, jobId);
+  const blocked = results.find(x => x.state !== 'unwritten');
+  if (blocked) throw new Error(`${blocked.id}: ${blocked.details}`);
 }
 
 // Log FIRST, metadata SECOND, status LAST. Never infer printing from a closed dialog.
